@@ -1,0 +1,112 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "a-share-selection-lab"
+version = "0.1.0"
+description = "A股每日选股、透明因子研究与自动复盘系统"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = { text = "Proprietary" }
+authors = [{ name = "A-Share Selection Lab contributors" }]
+dependencies = [
+  "alembic>=1.16,<2",
+  "apscheduler>=3.11,<4",
+  "exchange-calendars==4.13.2",
+  "fastapi>=0.116,<1",
+  "numpy>=1.26.4,<3",
+  "pandas>=2.2.3,<3",
+  "pyarrow>=18,<24",
+  "pydantic>=2.11,<3",
+  "pydantic-settings>=2.10,<3",
+  "python-multipart>=0.0.20,<1",
+  "sqlalchemy>=2.0.41,<3",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.optional-dependencies]
+factor-research = [
+  "alphalens-reloaded==0.4.6",
+]
+fast-backtest = [
+  "vectorbt==0.28.5",
+]
+rqalpha-validation = [
+  "rqalpha==6.3.0",
+]
+ml-research = [
+  "lightgbm==4.7.0",
+  "pyqlib==0.9.7",
+]
+quant-all = [
+  "alphalens-reloaded==0.4.6",
+  "lightgbm==4.7.0",
+  "pyqlib==0.9.7",
+  "rqalpha==6.3.0",
+  "vectorbt==0.28.5",
+]
+dev = [
+  "httpx>=0.28,<1",
+  "mypy>=1.17,<2",
+  "pandas-stubs>=2.2,<3",
+  "pytest>=8.4,<9",
+  "pytest-cov>=6.2,<8",
+  "pytest-mock>=3.14,<4",
+  "ruff>=0.12,<1",
+]
+
+[project.scripts]
+ashare-lab = "app.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/app"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --strict-config"
+pythonpath = ["backend"]
+testpaths = ["backend/tests"]
+markers = [
+  "optional: requires an optional third-party research engine",
+  "integration: crosses process, database, or HTTP boundaries",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["backend/app"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["B008"]
+allowed-confusables = ["，", "；", "："]
+
+[tool.ruff.lint.per-file-ignores]
+"backend/app/db/migrations/versions/*.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+plugins = ["pydantic.mypy"]
+files = ["backend/app"]
+exclude = ["backend/app/db/migrations"]
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = [
+  "alphalens.*",
+  "apscheduler.*",
+  "exchange_calendars.*",
+  "lightgbm.*",
+  "qlib.*",
+  "rqalpha.*",
+  "vectorbt.*",
+]
+ignore_missing_imports = true

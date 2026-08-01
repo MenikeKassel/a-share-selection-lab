@@ -1,0 +1,15 @@
+{
+  "strategy_code": "trend_quality_v1",
+  "start_date": "2025-01-01",
+  "end_date": "2026-01-01",
+  "signal_path": "./data/processed/signals/trend_quality_v1.parquet",
+  "benchmark_symbol": "000300.XSHG",
+  "top_n": 20,
+  "data_bundle_path": null,
+  "initial_cash": 1000000,
+  "stock_commission_multiplier": 1,
+  "minimum_commission": 5,
+  "tax_multiplier": 1,
+  "slippage": 0
+}
+

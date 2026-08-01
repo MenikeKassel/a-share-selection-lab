@@ -1,0 +1,16 @@
+{
+  "strategy_code": "trend_quality_v1",
+  "start_date": "2021-01-01",
+  "end_date": "2026-01-01",
+  "price_path": "./data/processed/daily/close.parquet",
+  "signal_path": "./data/processed/signals/trend_quality_v1.parquet",
+  "parameter_grid": {
+    "top_n": [10, 20, 30],
+    "holding_period": [5, 10, 20],
+    "rebalance_frequency": ["daily", "weekly"],
+    "commission_rate": [0.0003],
+    "slippage_bps": [5, 10]
+  },
+  "initial_cash": 1000000
+}
+

@@ -1,0 +1,22 @@
+{
+  "experiment_code": "lightgbm-rank-v1",
+  "model_type": "LightGBM",
+  "feature_path": "./data/processed/factors/qlib-features.parquet",
+  "feature_columns": ["rps_60d", "ma20_slope", "roe_ttm"],
+  "label_column": "label",
+  "feature_version": "transparent_factor_v1",
+  "label_definition": "next_5d_close_return",
+  "train_start": "2021-01-01",
+  "train_end": "2023-12-31",
+  "validation_start": "2024-01-01",
+  "validation_end": "2024-12-31",
+  "test_start": "2025-01-01",
+  "test_end": "2025-12-31",
+  "training_config": {
+    "n_estimators": 100,
+    "learning_rate": 0.05,
+    "num_leaves": 31
+  },
+  "rule_metrics": {}
+}
+

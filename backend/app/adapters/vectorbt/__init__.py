@@ -1,0 +1,1 @@
+"""VectorBT rapid-research adapter."""

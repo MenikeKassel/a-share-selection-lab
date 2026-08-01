@@ -1,0 +1,11 @@
+{
+  "factor_code": "rps_60d",
+  "start_date": "2024-01-01",
+  "end_date": "2026-01-01",
+  "horizons": [1, 5, 10, 20],
+  "group_count": 5,
+  "industry_neutral": false,
+  "factor_path": "./data/processed/factors/rps_60d.parquet",
+  "price_path": "./data/processed/daily/close.parquet"
+}
+
