@@ -36,6 +36,13 @@ class Settings(BaseSettings):
     min_minute_coverage_ratio: float = 0.0
     expected_universe_size: int = 0
     default_benchmark_symbol: str = "000300.SH"
+    freestockdb_enabled: bool = True
+    freestockdb_base_url: str = "http://127.0.0.1:7899"
+    freestockdb_connect_timeout_seconds: float = 2.0
+    freestockdb_read_timeout_seconds: float = 60.0
+    freestockdb_max_concurrency: int = 8
+    freestockdb_default_lookback_days: int = 400
+    freestockdb_minute_lookback_days: int = 45
 
     @field_validator("data_root", "artifact_root", mode="after")
     @classmethod

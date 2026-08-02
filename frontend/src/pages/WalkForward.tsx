@@ -183,6 +183,20 @@ function WalkForwardRunCard({ run }: { run: WalkForwardRun }) {
         <span>数据快照</span>
         <code>{run.data_snapshot_version ?? "—"}</code>
       </div>
+      {run.data_source_summary || run.snapshot_audit ? (
+        <div className="experiment-meta">
+          <span>Data source</span>
+          <code>
+            {String(run.data_source_summary?.type ?? "imported_snapshot")}
+          </code>
+          <span>Daily coverage</span>
+          <code>
+            {percent(Number(run.snapshot_audit?.daily_coverage_ratio ?? NaN))}
+          </code>
+          <span>Minute confirmation</span>
+          <code>unavailable / reduced</code>
+        </div>
+      ) : null}
     </article>
   );
 }
@@ -239,6 +253,9 @@ function SplitRow({
         <span>回撤</span>
         <strong>{percent(metrics.max_drawdown)}</strong>
       </div>
+      {split.failure_reason ? (
+        <p className="muted-copy">Failure reason: {split.failure_reason}</p>
+      ) : null}
     </div>
   );
 }
@@ -300,7 +317,9 @@ function tone(
 }
 
 function percent(value: number | null | undefined) {
-  return value == null ? "—" : `${(value * 100).toFixed(2)}%`;
+  return value == null || !Number.isFinite(value)
+    ? "—"
+    : `${(value * 100).toFixed(2)}%`;
 }
 
 function decimal(value: number | null | undefined) {

@@ -1,5 +1,11 @@
 export type RunStatus =
-  "blocked" | "running" | "succeeded" | "failed" | "unavailable" | "pending";
+  | "blocked"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "unavailable"
+  | "pending"
+  | "ready";
 
 export interface EngineRun {
   id: number;
@@ -132,6 +138,7 @@ export interface WalkForwardSplit {
   test_metrics?: WalkForwardMetrics;
   gate_results?: Record<string, boolean>;
   gate_failures?: string[];
+  failure_reason?: string;
   status?: string;
 }
 
@@ -151,6 +158,8 @@ export interface WalkForwardResult {
   gate_results?: WalkForwardGate | Record<string, boolean>;
   factor_results?: Array<Record<string, unknown>>;
   signal_audit?: Record<string, unknown>;
+  snapshot_audit?: Record<string, unknown>;
+  data_source_summary?: Record<string, unknown>;
   error?: string;
   [field: string]: unknown;
 }
@@ -178,6 +187,8 @@ export interface WalkForwardRun {
   error_message?: string | null;
   created_at: string;
   completed_at?: string | null;
+  snapshot_audit?: Record<string, unknown>;
+  data_source_summary?: Record<string, unknown>;
 }
 
 export interface WalkForwardRunRequest {
@@ -229,4 +240,42 @@ export interface DataQualitySnapshot {
     minute_confirmation?: string;
     data_confidence?: string;
   };
+}
+
+export interface DataProviderStatus {
+  provider_code: string;
+  configured: boolean;
+  reachable: boolean;
+  endpoint: string;
+  read_only: boolean;
+  daily_latest_date: string | null;
+  minute_latest_date: string | null;
+  daily_instrument_count: number;
+  minute_instrument_count: number;
+  capabilities: string[];
+  limitations: string[];
+  checked_at: string | null;
+  error: string | null;
+}
+
+export interface MarketDataSnapshot {
+  id: number;
+  provider_code: string;
+  snapshot_code: string;
+  status: RunStatus;
+  start_date: string;
+  end_date: string;
+  daily_latest_date: string | null;
+  minute_latest_date: string | null;
+  daily_row_count: number;
+  daily_symbol_count: number;
+  daily_coverage_ratio: number;
+  minute_coverage_ratio: number;
+  manifest_path?: string | null;
+  daily_path?: string | null;
+  walk_forward_eligible: boolean;
+  metadata?: Record<string, unknown> | null;
+  error_message?: string | null;
+  created_at: string;
+  completed_at?: string | null;
 }

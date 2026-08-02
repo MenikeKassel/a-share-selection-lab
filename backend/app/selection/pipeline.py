@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -63,6 +64,7 @@ class DailySelectionPipeline:
         now: datetime,
         expected_universe_size: int,
         minute_data: dict[str, pd.DataFrame] | None = None,
+        minute_loader: Callable[[list[str], date], dict[str, pd.DataFrame]] | None = None,
         minute_volume_unit: Literal["shares", "lots"] = "shares",
         financials: pd.DataFrame | None = None,
         valuations: pd.DataFrame | None = None,
@@ -172,6 +174,16 @@ class DailySelectionPipeline:
         ranked["risk_penalty"] = ranked["risk_penalty"].fillna(0.0)
         ranked = ranked.sort_values("composite_score", ascending=False)
         ranked = ranked.head(200)
+        if minute_loader is not None:
+            try:
+                loaded_minutes = minute_loader(
+                    ranked.head(50)["symbol"].astype(str).tolist(), latest_date
+                )
+                minute_data = {**(minute_data or {}), **loaded_minutes}
+            except Exception:
+                # Minute confirmation is deliberately degradable.  Daily data
+                # freshness and quality still decide whether selection runs.
+                minute_data = minute_data or {}
         factor_details = factor_output.details.copy()
         factor_details["is_risk"] = False
         factor_details["risk_penalty_contribution"] = 0.0
@@ -295,7 +307,7 @@ class DailySelectionPipeline:
         eligible = latest_market.copy()
         for column in ("is_st", "delisting_risk", "suspended"):
             if column in eligible:
-                eligible = eligible.loc[~eligible[column].fillna(False).astype(bool)]
+                eligible = eligible.loc[~eligible[column].eq(True)]
         if "listing_days" in eligible:
             eligible = eligible.loc[eligible["listing_days"].fillna(0) >= 60]
         eligible = eligible.loc[eligible["volume"].fillna(0) > 0]

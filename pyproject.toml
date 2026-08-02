@@ -15,6 +15,7 @@ dependencies = [
   "apscheduler>=3.11,<4",
   "exchange-calendars==4.13.2",
   "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
   "numpy>=1.26.4,<3",
   "pandas>=2.2.3,<3",
   "pyarrow>=18,<24",
@@ -47,7 +48,6 @@ quant-all = [
   "vectorbt==0.28.5",
 ]
 dev = [
-  "httpx>=0.28,<1",
   "mypy>=1.17,<2",
   "pandas-stubs>=2.2,<3",
   "pytest>=8.4,<9",

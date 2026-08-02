@@ -12,6 +12,7 @@ import { NavLink, Outlet } from "react-router-dom";
 const navigation = [
   { to: "/", label: "每日候选", icon: CandlestickChart },
   { to: "/research-engines", label: "研究引擎", icon: DatabaseZap },
+  { to: "/market-data", label: "行情数据", icon: DatabaseZap },
   { to: "/factor-research", label: "因子研究", icon: FlaskConical },
   { to: "/backtests", label: "回测实验", icon: BarChart3 },
   { to: "/ml-experiments", label: "模型实验", icon: BrainCircuit },

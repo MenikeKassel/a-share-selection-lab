@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
+from app.research.factors.pipeline import FactorPipeline
 from app.research.historical_signals import HistoricalSignalGenerator
 
 
@@ -119,3 +121,36 @@ def test_historical_signal_schema_contains_versions_and_factor_audit() -> None:
     assert row["minute_confirmation"] == "unavailable"
     assert isinstance(row["factor_audit"], list)
     assert {"raw_value", "processed_value", "factor_code"}.issubset(row["factor_audit"][0])
+
+
+def test_research_view_uses_causal_adjusted_prices_without_losing_execution_prices() -> None:
+    daily = _market(periods=5).assign(
+        adj_open=lambda frame: frame["open"] * 2,
+        adj_high=lambda frame: frame["high"] * 2,
+        adj_low=lambda frame: frame["low"] * 2,
+        adj_close=lambda frame: frame["close"] * 2,
+        adj_pre_close=lambda frame: frame["close"].shift(1).fillna(frame["close"]) * 2,
+    )
+
+    prepared = HistoricalSignalGenerator._prepare_market(daily, state_history=None)
+
+    assert prepared["price_basis"].eq("causal_hfq").all()
+    assert (prepared["close"] == prepared["execution_close"] * 2).all()
+
+
+def test_historical_factor_pipeline_processes_bounded_date_batches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_date_counts: list[int] = []
+    original = FactorPipeline.transform
+
+    def recording_transform(self, raw):
+        observed_date_counts.append(int(pd.to_datetime(raw["date"]).nunique()))
+        return original(self, raw)
+
+    monkeypatch.setattr(FactorPipeline, "transform", recording_transform)
+
+    _generate(_market(periods=23, include_stall=False))
+
+    assert len(observed_date_counts) > 2
+    assert max(observed_date_counts) <= HistoricalSignalGenerator.cross_section_batch_days

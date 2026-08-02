@@ -8,7 +8,7 @@ Alphalens Reloaded、VectorBT、RQAlpha 与 Qlib。
 
 本仓库：
 
-- 不连接或修改 FreeStockDB；
+- 不启动、停止或修改 FreeStockDB；如启用，仅通过本项目的本机只读行情适配器读取；
 - 不连接或修改任何 KOL 研究台；
 - 不自动下单；
 - 不预测或承诺“明天必涨停”；
@@ -151,8 +151,9 @@ Copy-Item .env.example .env
 npm run dev
 ```
 
-打开 <http://127.0.0.1:5173>。开发服务器会将 `/api` 代理到
-`127.0.0.1:8000`。
+打开 <http://127.0.0.1:5173>。开发服务器默认将 `/api` 代理到
+`127.0.0.1:8000`；如果后端使用其它本机端口，可在 `frontend/.env` 设置
+`VITE_BACKEND_URL`。
 
 ### 可选量化引擎
 
@@ -586,12 +587,51 @@ ASHARE_CORS_ORIGINS
 ASHARE_MIN_DAILY_COVERAGE_RATIO
 ASHARE_EXPECTED_UNIVERSE_SIZE
 ASHARE_SCHEDULER_ENABLED
+ASHARE_FREESTOCKDB_ENABLED
+ASHARE_FREESTOCKDB_BASE_URL
+ASHARE_FREESTOCKDB_CONNECT_TIMEOUT_SECONDS
+ASHARE_FREESTOCKDB_READ_TIMEOUT_SECONDS
+ASHARE_FREESTOCKDB_MAX_CONCURRENCY
+ASHARE_FREESTOCKDB_DEFAULT_LOOKBACK_DAYS
+ASHARE_FREESTOCKDB_MINUTE_LOOKBACK_DAYS
 ```
+
+## FreeStockDB 只读行情提供者
+
+本项目可以把本机 FreeStockDB（默认 `http://127.0.0.1:7899`）作为日线和分钟线
+提供者。适配器只使用 HTTP 读取接口，不启动、停止、修改或写入 FreeStockDB，
+也不会读取其它仓库。日线先落成带 manifest 和 SHA-256 的不可覆盖 Parquet 快照，
+选股时只对前排候选按需读取并缓存分钟线。
+
+```powershell
+$env:ASHARE_FREESTOCKDB_ENABLED = "true"
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/data-providers/freestockdb/status
+```
+
+生成默认最近 400 个日历日快照：
+
+```powershell
+Invoke-RestMethod http://127.0.0.1:8000/api/v1/market-data-snapshots `
+  -Method Post -ContentType "application/json" `
+  -Body '{"provider_code":"freestockdb","lookback_days":400}'
+```
+
+2024 验收不能与“最近 400 日”混用：请单独提交
+`start_date=2024-01-01`、`end_date=2024-12-31`，并在实验输入中保留至少
+2022-01-01 起的暖机区间和未来 60 个交易日的复盘缓冲。FreeStockDB 当前不提供
+历史 `available_at` 财务公告、有效期行业分类或 CSI300 指数序列，因此这类快照的
+`walk_forward_eligible` 始终为 `false`；它可用于日线选股和短期验收，不能冒充
+2018--2025 的 point-in-time Walk-forward 数据集。
+
+分钟数据单位固定为 `shares`。缺失分钟数据会标记为
+`minute_confirmation=unavailable`、`data_confidence=reduced`，不会记为零分。
+数据源没有逐笔成交、Bid/Ask、Level-2、CVD、Delta 或 Footprint；系统不会从分钟
+K 线伪造这些字段。
 
 ## 2018--2025 trend-quality Walk-forward 验证
 
 本仓库新增独立的真实数据验证入口，数据只从本仓库的
-`data/raw/imports/ashare-2018-2025-v1/manifest.json` 读取，不连接
+`data/raw/imports/ashare-2018-2025-v1/manifest.json` 读取，不调用
 FreeStockDB、ai-hub 或 KOL 项目。导入快照应至少包含：
 
 ```text
@@ -611,7 +651,7 @@ state_history.(parquet|csv) # 可选，effective_date 的历史股票池/ST/行�
 
 ```powershell
 $payload = @{
-  experiment_code = "trend-quality-wf-2018-2025-v1"
+  experiment_code = "trend-quality-wf-2018-2025-purchased-v6"
   strategy_code = "trend_quality_v1"
   snapshot_manifest_path = "data/raw/imports/ashare-2018-2025-v1/manifest.json"
 } | ConvertTo-Json
@@ -633,7 +673,71 @@ GET /api/v1/walk-forward-experiments
 GET /api/v1/walk-forward-experiments/{id}
 ```
 
-前端路径为 `/walk-forward-experiments`。当前工作区尚未提供独立的 2018--2025 真实快照，
-因此默认请求会被明确记录为 `blocked`；这是数据边界保护，不是回测收益结论。
+## Purchased 2018--2025 validation snapshot
+
+The purchased archive at `D:\a_data\数据更新时间2026.7.31` is read-only input. The importer
+keeps raw prices for the formal A-share execution model and reconstructs causal adjusted
+prices from the row-level `adj_factor` for factors/PA/Wyckoff. It never uses the supplied
+latest-date qfq columns for historical signals.
+
+The importer includes 2016--2017 warm-up rows and validates the 2018--2025 experiment range:
+
+```powershell
+uv run ashare-lab import-purchased-snapshot `
+  --source 'D:\a_data\数据更新时间2026.7.31' `
+  --snapshot-root data/raw/imports `
+  --snapshot-id ashare-2018-2025-v1 `
+  --start-date 2016-01-01 --end-date 2025-12-31
+```
+
+The snapshot remains staged until TinyShare has supplied a CSI300 benchmark, historical
+industry/state, point-in-time valuation/financial data and suspension records. TinyShare is
+executed only in a separate interpreter and is never imported by the FastAPI process:
+
+```powershell
+$env:TINYSHARE_TOKEN = '<session-only credential>'
+$env:TINYSHARE_PYTHON = 'C:\path\to\audited\python.exe'
+uv run ashare-lab probe-supplement-provider
+uv run ashare-lab import-purchased-snapshot `
+  --source 'D:\a_data\数据更新时间2026.7.31' `
+  --snapshot-root data/raw/imports `
+  --snapshot-id ashare-2018-2025-v1 `
+  --supplement-tinyshare
+```
+
+The probe output includes the isolated `tinyshare` distribution version and module SHA-256;
+the capability matrix must be complete before the snapshot can become `ready`.
+
+The token is not accepted as a command-line argument and is not written to the manifest,
+database, logs or reports. On Windows, the repository also provides a helper that asks for the
+token as a secure string, uses the isolated interpreter under `data/runtime/tinyshare-venv`,
+and clears the token when the child process exits:
+
+```powershell
+& .\scripts\run-purchased-import.ps1 `
+  -Source 'D:\a_data\数据更新时间2026.7.31' `
+  -RunWalkForward
+```
+
+If a required endpoint or the daily coverage gate is unavailable,
+the snapshot is marked `blocked` and the walk-forward run cannot produce a formal result.
+
+Run the immutable experiment after the manifest is `ready`:
+
+```powershell
+uv run ashare-lab run-walk-forward `
+  --experiment-code trend-quality-wf-2018-2025-purchased-v6 `
+  --manifest data/raw/imports/ashare-2018-2025-v1/manifest.json
+```
+
+This run uses four frozen rolling windows and the self-owned `ashare_daily_v1` execution
+engine. A successful technical run may still remain `experimental` when the statistical
+promotion gates fail; no result is automatically enabled for production.
+
+前端路径为 `/walk-forward-experiments`。购入数据和完整 Parquet 产物不会提交到 Git；
+本机完成的 `trend-quality-wf-2018-2025-purchased-v6` 紧凑审计记录、报告和哈希清单会
+随代码版本化，见 [实验记录](docs/experiments/trend-quality-wf-2018-2025-purchased-v6.md)。
+该实验技术上成功，但所有训练窗口都没有参数通过成本与回撤过滤，因此策略仍为
+`experimental`，而非生产策略。
 
 不要把 `.env`、数据库、原始行情、Parquet 因子明细或引擎 artifact 提交到 Git。

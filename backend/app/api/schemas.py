@@ -117,7 +117,8 @@ class FormalBacktestRunRequest(BaseModel):
 
 
 class SelectionRunRequest(BaseModel):
-    daily_path: str
+    daily_path: str | None = None
+    market_data_snapshot_id: int | None = Field(default=None, ge=1)
     minute_directory: str | None = None
     minute_volume_unit: Literal["shares", "lots"] = "shares"
     financial_path: str | None = None
@@ -126,6 +127,19 @@ class SelectionRunRequest(BaseModel):
     industry_rps_path: str | None = None
     expected_trade_date: date | None = None
     expected_universe_size: int = Field(default=0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_market_source(self) -> SelectionRunRequest:
+        if not self.daily_path and self.market_data_snapshot_id is None:
+            raise ValueError("daily_path or market_data_snapshot_id is required")
+        return self
+
+
+class MarketDataSnapshotRequest(BaseModel):
+    provider_code: Literal["freestockdb"] = "freestockdb"
+    start_date: date | None = None
+    end_date: date | None = None
+    lookback_days: int | None = Field(default=None, ge=30, le=5000)
 
 
 class ReviewRunRequest(BaseModel):

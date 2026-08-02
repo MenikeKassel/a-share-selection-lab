@@ -158,6 +158,35 @@ class DataQualitySnapshot(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class MarketDataSnapshot(Base):
+    """Immutable materialized data supplied by a market-data provider."""
+
+    __tablename__ = "market_data_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    provider_code: Mapped[str] = mapped_column(String(64), index=True)
+    snapshot_code: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    start_date: Mapped[date] = mapped_column(Date)
+    end_date: Mapped[date] = mapped_column(Date)
+    daily_latest_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    minute_latest_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    daily_row_count: Mapped[int] = mapped_column(Integer, default=0)
+    daily_symbol_count: Mapped[int] = mapped_column(Integer, default=0)
+    daily_coverage_ratio: Mapped[float] = mapped_column(Float, default=0.0)
+    minute_coverage_ratio: Mapped[float] = mapped_column(Float, default=0.0)
+    manifest_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    daily_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    adjustment_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    minute_directory: Mapped[str | None] = mapped_column(Text, nullable=True)
+    config_json: Mapped[str] = mapped_column(Text, default="{}")
+    metadata_json: Mapped[str] = mapped_column(Text, default="{}")
+    walk_forward_eligible: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class SelectionSnapshot(Base):
     __tablename__ = "selection_snapshots"
     __table_args__ = (

@@ -12,6 +12,7 @@ from app.db.models import (
     EngineComparison,
     ExternalEngineRun,
     FactorAnalysisResultRecord,
+    MarketDataSnapshot,
     ModelExperiment,
     WalkForwardExperiment,
 )
@@ -299,6 +300,88 @@ class BacktestRunRepository:
 
     def list(self, limit: int = 100) -> list[BacktestRun]:
         statement = select(BacktestRun).order_by(desc(BacktestRun.created_at)).limit(limit)
+        return list(self.session.scalars(statement))
+
+
+class MarketDataSnapshotRepository:
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def create(
+        self,
+        *,
+        provider_code: str,
+        snapshot_code: str,
+        start_date: date,
+        end_date: date,
+        config: dict[str, Any],
+    ) -> MarketDataSnapshot:
+        record = MarketDataSnapshot(
+            provider_code=provider_code,
+            snapshot_code=snapshot_code,
+            status="running",
+            start_date=start_date,
+            end_date=end_date,
+            daily_row_count=0,
+            daily_symbol_count=0,
+            daily_coverage_ratio=0.0,
+            minute_coverage_ratio=0.0,
+            config_json=_json(config),
+            metadata_json="{}",
+            walk_forward_eligible=False,
+        )
+        self.session.add(record)
+        self.session.commit()
+        self.session.refresh(record)
+        return record
+
+    def finish(
+        self,
+        record: MarketDataSnapshot,
+        *,
+        status: str,
+        metadata: dict[str, Any] | None = None,
+        manifest_path: str | None = None,
+        daily_path: str | None = None,
+        adjustment_path: str | None = None,
+        minute_directory: str | None = None,
+        daily_latest_date: date | None = None,
+        minute_latest_date: date | None = None,
+        daily_row_count: int = 0,
+        daily_symbol_count: int = 0,
+        daily_coverage_ratio: float = 0.0,
+        minute_coverage_ratio: float = 0.0,
+        walk_forward_eligible: bool = False,
+        error_message: str | None = None,
+    ) -> MarketDataSnapshot:
+        record.status = status
+        record.metadata_json = _json(metadata or {})
+        record.manifest_path = manifest_path
+        record.daily_path = daily_path
+        record.adjustment_path = adjustment_path
+        record.minute_directory = minute_directory
+        record.daily_latest_date = daily_latest_date
+        record.minute_latest_date = minute_latest_date
+        record.daily_row_count = daily_row_count
+        record.daily_symbol_count = daily_symbol_count
+        record.daily_coverage_ratio = daily_coverage_ratio
+        record.minute_coverage_ratio = minute_coverage_ratio
+        record.walk_forward_eligible = bool(walk_forward_eligible)
+        record.error_message = error_message
+        record.completed_at = datetime.now(UTC)
+        self.session.commit()
+        self.session.refresh(record)
+        return record
+
+    def get(self, snapshot_id: int) -> MarketDataSnapshot | None:
+        return self.session.get(MarketDataSnapshot, snapshot_id)
+
+    def list(self, limit: int = 100) -> list[MarketDataSnapshot]:
+        statement = (
+            select(MarketDataSnapshot)
+            .order_by(desc(MarketDataSnapshot.created_at), desc(MarketDataSnapshot.id))
+            .limit(limit)
+        )
         return list(self.session.scalars(statement))
 
 

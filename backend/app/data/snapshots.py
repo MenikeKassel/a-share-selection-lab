@@ -203,20 +203,80 @@ def audit_snapshot_files(
     observed = daily.assign(date=pd.to_datetime(daily["date"], errors="coerce"))
     if observed["date"].isna().any():
         raise SnapshotManifestError("daily market data contains invalid dates")
-    if expected > 0:
+    universe_path = snapshot.file("universe", required=False)
+    universe = _read_tabular(universe_path) if universe_path is not None else None
+    suspensions_path = snapshot.file("suspensions", required=False)
+    suspensions = _read_tabular(suspensions_path) if suspensions_path is not None else None
+    suspended_by_date: dict[pd.Timestamp, set[str]] = {}
+    if suspensions is not None and {"date", "symbol"}.issubset(suspensions.columns):
+        suspension_dates = pd.to_datetime(suspensions["date"], format="mixed", errors="coerce")
+        for day, symbol in zip(suspension_dates, suspensions["symbol"], strict=False):
+            if pd.notna(day):
+                suspended_by_date.setdefault(pd.Timestamp(day).normalize(), set()).add(str(symbol))
+    if universe is not None and {"symbol", "list_date"}.issubset(universe.columns):
+        universe = universe.copy()
+        universe["list_date"] = pd.to_datetime(
+            universe["list_date"], format="mixed", errors="coerce"
+        )
+        if "delist_date" not in universe:
+            universe["delist_date"] = pd.NaT
+        universe["delist_date"] = pd.to_datetime(
+            universe["delist_date"], format="mixed", errors="coerce"
+        )
+        if "last_observed_date" in universe:
+            # The purchased archive has no explicit delist field.  Treat a
+            # symbol's last observed bar as an inferred end date only for the
+            # coverage denominator; the exact external stock_basic date, when
+            # present, always takes precedence.
+            inferred = pd.to_datetime(
+                universe["last_observed_date"], format="mixed", errors="coerce"
+            )
+            universe["delist_date"] = universe["delist_date"].fillna(inferred)
+        expected_by_date: dict[pd.Timestamp, int] = {}
+        for current_date in sorted(observed["date"].dt.normalize().unique()):
+            active = universe.loc[universe["list_date"].le(current_date)]
+            if "delist_date" in active:
+                active = active.loc[
+                    active["delist_date"].isna() | active["delist_date"].ge(current_date)
+                ]
+            expected_by_date[pd.Timestamp(current_date)] = int(
+                active["symbol"].astype(str).nunique()
+            )
+        observed_by_date = {
+            pd.Timestamp(day).normalize(): set(group["symbol"].astype(str))
+            for day, group in observed.groupby(observed["date"].dt.normalize())
+        }
+        ratios = []
+        for day in expected_by_date:
+            expected_symbols = set(
+                universe.loc[
+                    universe["list_date"].le(day)
+                    & (universe["delist_date"].isna() | universe["delist_date"].ge(day)),
+                    "symbol",
+                ].astype(str)
+            )
+            suspended = suspended_by_date.get(pd.Timestamp(day).normalize(), set())
+            tradable_expected = expected_symbols.difference(suspended)
+            effective_expected = len(tradable_expected)
+            if effective_expected:
+                actual_symbols = observed_by_date.get(pd.Timestamp(day).normalize(), set())
+                observed_count = len(actual_symbols.intersection(tradable_expected))
+                ratios.append(float(observed_count / effective_expected))
+        coverage = float(min(ratios)) if ratios else 0.0
+    elif expected > 0:
         coverage = float(
             observed.groupby(observed["date"].dt.normalize())["symbol"].nunique().mean() / expected
         )
-        if coverage < minimum_coverage_ratio:
-            raise SnapshotManifestError(
-                f"daily coverage ratio {coverage:.2%} is below {minimum_coverage_ratio:.2%}"
-            )
     else:
         coverage = float(snapshot.coverage_ratio)
+    if coverage < minimum_coverage_ratio:
+        raise SnapshotManifestError(
+            f"daily coverage ratio {coverage:.2%} is below {minimum_coverage_ratio:.2%}"
+        )
     for name in ("financials", "valuations"):
         path = snapshot.file(name, required=False)
         if path is not None:
-            validate_point_in_time_frame(_read_tabular(path), name=name)
+            validate_point_in_time_path(path, name=name)
     hashes = snapshot.metadata.get("content_hashes", {})
     file_specs = snapshot.metadata.get("files", {})
     if isinstance(file_specs, Mapping):
@@ -302,6 +362,32 @@ def validate_point_in_time_frame(
     # financial disclosures.  The explicit cutoff is recorded for callers to
     # use in as-of joins (the calculator applies it at each market date).
     _ = cutoff_delta
+
+
+def validate_point_in_time_path(
+    path: str | Path,
+    *,
+    name: str = "point-in-time dataset",
+    cutoff: time = time(18, 30),
+    batch_size: int = 100_000,
+) -> None:
+    """Validate a large PIT Parquet incrementally instead of loading it twice."""
+
+    resolved = Path(path)
+    if resolved.suffix.lower() != ".parquet":
+        validate_point_in_time_frame(_read_tabular(resolved), name=name, cutoff=cutoff)
+        return
+    import pyarrow.parquet as parquet  # type: ignore[import-untyped]
+
+    parquet_file = parquet.ParquetFile(resolved)
+    missing = POINT_IN_TIME_REQUIRED_COLUMNS.difference(parquet_file.schema_arrow.names)
+    if missing:
+        raise SnapshotManifestError(
+            f"{name} is missing point-in-time audit columns: {sorted(missing)}"
+        )
+    columns = sorted(POINT_IN_TIME_REQUIRED_COLUMNS)
+    for batch in parquet_file.iter_batches(batch_size=batch_size, columns=columns):
+        validate_point_in_time_frame(batch.to_pandas(), name=name, cutoff=cutoff)
 
 
 def _normalise_cutoff(value: str) -> str:

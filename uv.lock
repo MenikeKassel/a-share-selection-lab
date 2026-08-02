@@ -15,6 +15,7 @@ dependencies = [
     { name = "apscheduler" },
     { name = "exchange-calendars" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "numpy", version = "1.26.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "pandas" },
@@ -28,7 +29,6 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "mypy" },
     { name = "pandas-stubs" },
     { name = "pytest" },
@@ -65,7 +65,7 @@ requires-dist = [
     { name = "apscheduler", specifier = ">=3.11,<4" },
     { name = "exchange-calendars", specifier = "==4.13.2" },
     { name = "fastapi", specifier = ">=0.116,<1" },
-    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.28,<1" },
+    { name = "httpx", specifier = ">=0.28,<1" },
     { name = "lightgbm", marker = "extra == 'ml-research'", specifier = "==4.7.0" },
     { name = "lightgbm", marker = "extra == 'quant-all'", specifier = "==4.7.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.17,<2" },

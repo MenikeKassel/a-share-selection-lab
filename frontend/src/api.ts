@@ -1,9 +1,11 @@
 import type {
   BacktestRun,
+  DataProviderStatus,
   DataQualitySnapshot,
   EngineStatus,
   FactorAnalysisRow,
   ModelExperiment,
+  MarketDataSnapshot,
   SelectionSnapshot,
   WalkForwardRun,
   WalkForwardRunRequest,
@@ -38,6 +40,17 @@ async function postJson<T>(path: string, payload: unknown): Promise<T> {
 
 export const api = {
   engines: () => getJson<EngineStatus[]>("/engines/status"),
+  dataProviders: () => getJson<DataProviderStatus[]>("/data-providers"),
+  dataProviderStatus: () =>
+    getJson<DataProviderStatus>("/data-providers/freestockdb/status"),
+  marketDataSnapshots: () =>
+    getJson<MarketDataSnapshot[]>("/market-data-snapshots"),
+  createMarketDataSnapshot: (payload: {
+    provider_code: "freestockdb";
+    start_date?: string;
+    end_date?: string;
+    lookback_days?: number;
+  }) => postJson<MarketDataSnapshot>("/market-data-snapshots", payload),
   factorAnalysis: () => getJson<FactorAnalysisRow[]>("/factor-analysis"),
   formalBacktests: () => getJson<BacktestRun[]>("/backtests"),
   experiments: () => getJson<ModelExperiment[]>("/ml-experiments"),

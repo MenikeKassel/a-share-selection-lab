@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import time
+from datetime import date, time
 
 import numpy as np
 import pandas as pd
@@ -23,7 +23,7 @@ def asof_join_available_data(
             f"point-in-time data is missing audit metadata: {sorted(metadata_missing)}"
         )
     left = daily.copy()
-    left["date"] = pd.to_datetime(left["date"]).dt.normalize()
+    left["date"] = _as_shanghai_local_naive(left["date"]).dt.normalize()
     left["symbol"] = left["symbol"].astype(str)
     left["_asof_timestamp"] = left["date"] + pd.Timedelta(
         hours=information_cutoff.hour,
@@ -32,17 +32,15 @@ def asof_join_available_data(
     )
     right = point_in_time.copy()
     right["symbol"] = right["symbol"].astype(str)
-    right["available_at"] = pd.to_datetime(
-        right["available_at"],
-        format="mixed",
-        errors="raise",
-    )
+    right["available_at"] = _as_shanghai_local_naive(right["available_at"])
 
     joined: list[pd.DataFrame] = []
+    right_groups = right.groupby("symbol", sort=False)
     for symbol, left_symbol in left.groupby("symbol", sort=False):
-        right_symbol = right.loc[right["symbol"] == symbol].sort_values("available_at")
         left_symbol = left_symbol.sort_values("_asof_timestamp")
-        if right_symbol.empty:
+        try:
+            right_symbol = right_groups.get_group(symbol).sort_values("available_at")
+        except KeyError:
             joined.append(left_symbol)
             continue
         right_symbol = right_symbol.drop(columns=["symbol"])
@@ -61,6 +59,15 @@ def asof_join_available_data(
     return output.sort_values(["date", "symbol"]).reset_index(drop=True)
 
 
+def _as_shanghai_local_naive(values: pd.Series) -> pd.Series:
+    """Normalise explicit UTC+08 timestamps to the local-naive signal clock."""
+
+    parsed = pd.to_datetime(values, format="mixed", errors="raise")
+    if isinstance(parsed.dtype, pd.DatetimeTZDtype):
+        return parsed.dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
+    return parsed
+
+
 class DailyFactorCalculator:
     """Transparent daily factors; no ML model participates in formal ranking."""
 
@@ -72,6 +79,8 @@ class DailyFactorCalculator:
         valuations: pd.DataFrame | None = None,
         benchmark: pd.DataFrame | None = None,
         industry_rps: pd.DataFrame | None = None,
+        output_start: date | None = None,
+        output_end: date | None = None,
     ) -> pd.DataFrame:
         required = {
             "date",
@@ -101,10 +110,25 @@ class DailyFactorCalculator:
             if column not in frame:
                 frame[column] = default
 
-        calculated = [
-            self._calculate_symbol(section.copy())
-            for _, section in frame.groupby("symbol", sort=False)
-        ]
+        output_start_at = pd.Timestamp(output_start) if output_start is not None else None
+        output_end_at = pd.Timestamp(output_end) if output_end is not None else None
+        if (
+            output_start_at is not None
+            and output_end_at is not None
+            and output_start_at > output_end_at
+        ):
+            raise ValueError("factor output date window is reversed")
+        calculated: list[pd.DataFrame] = []
+        for _, section in frame.groupby("symbol", sort=False):
+            result = self._calculate_symbol(section.copy())
+            if output_start_at is not None:
+                result = result.loc[result["date"] >= output_start_at]
+            if output_end_at is not None:
+                result = result.loc[result["date"] <= output_end_at]
+            if not result.empty:
+                calculated.append(result)
+        if not calculated:
+            raise ValueError("factor output date window contains no rows")
         output = pd.concat(calculated, ignore_index=True)
         output = self._cross_sectional_strength(output)
         output = self._benchmark_relative(output, benchmark)

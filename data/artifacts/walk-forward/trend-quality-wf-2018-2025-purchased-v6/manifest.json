@@ -1,0 +1,12 @@
+{
+  "experiment_code": "trend-quality-wf-2018-2025-purchased-v6",
+  "strategy_code": "trend_quality_v1",
+  "immutable": true,
+  "production_enabled": false,
+  "files": {
+    "rejected.parquet": "a2ad3e50406a415b60a79c50d39329ce1c2cc1bf69eeafd12517771b9b857e6a",
+    "REPORT.md": "8f2fb4209ac4b86058797492e9592b3e97f84131d18c383f263ca28053eea6e0",
+    "result.json": "3b8f6318db8b3f6130e1a2230c2f39aded158b5df74af6de4a0979da2c0e6cb0",
+    "signals.parquet": "80d028d6ad4a593b92a2646dd673965ab2dda90a32d163da6e9184f7c1d5fecd"
+  }
+}

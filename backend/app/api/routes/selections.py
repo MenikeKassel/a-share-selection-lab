@@ -22,10 +22,12 @@ from app.data.trading_calendar import (
     TradingCalendarRangeError,
 )
 from app.db.models import CandidateReview, DataQualitySnapshot, SelectionSnapshot
+from app.db.repositories import MarketDataSnapshotRepository
 from app.db.session import get_db
 from app.selection.pipeline import DailySelectionPipeline
 from app.selection.review import AutomaticReviewService
 from app.selection.snapshots import SelectionSnapshotRepository
+from app.services.market_data import MarketDataSnapshotError, MarketDataSnapshotService
 
 router = APIRouter(tags=["selection-and-review"])
 
@@ -36,7 +38,23 @@ def run_selection(
     session: Session = Depends(get_db),
     settings: Settings = Depends(get_settings),
 ) -> dict[str, object]:
-    daily = read_tabular(_data_path(payload.daily_path, settings))
+    minute_loader = None
+    snapshot_expected_size = 0
+    if payload.market_data_snapshot_id is not None:
+        market_snapshot = MarketDataSnapshotRepository(session).get(payload.market_data_snapshot_id)
+        if market_snapshot is None:
+            raise HTTPException(status_code=404, detail="market data snapshot not found")
+        try:
+            market_service = MarketDataSnapshotService(settings)
+            daily = market_service.load_daily(market_snapshot)
+            minute_loader = market_service.minute_loader(market_snapshot)
+            metadata = json.loads(market_snapshot.metadata_json or "{}")
+            snapshot_expected_size = int(metadata.get("expected_universe_size", 0) or 0)
+        except (MarketDataSnapshotError, OSError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+    else:
+        assert payload.daily_path is not None
+        daily = read_tabular(_data_path(payload.daily_path, settings))
     daily_dates = pd.to_datetime(daily["date"]).dt.date.unique().tolist()
     now = datetime.now(ZoneInfo(settings.timezone))
     try:
@@ -49,7 +67,11 @@ def run_selection(
         daily_dates.append(expected_trade_date)
     expected_size = estimate_expected_universe_size(
         daily,
-        configured_size=(payload.expected_universe_size or settings.expected_universe_size),
+        configured_size=(
+            payload.expected_universe_size
+            or snapshot_expected_size
+            or settings.expected_universe_size
+        ),
     )
     minute_data = _read_minute_directory(payload.minute_directory, settings)
     result = DailySelectionPipeline(
@@ -62,6 +84,7 @@ def run_selection(
         now=now,
         expected_universe_size=expected_size,
         minute_data=minute_data,
+        minute_loader=minute_loader,
         minute_volume_unit=payload.minute_volume_unit,
         financials=_optional_frame(payload.financial_path, settings),
         valuations=_optional_frame(payload.valuation_path, settings),

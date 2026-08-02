@@ -13,6 +13,7 @@ from app.api.routes import (
     engines,
     experiments,
     factor_analysis,
+    market_data,
     selections,
     walk_forward,
 )
@@ -53,6 +54,7 @@ def create_app() -> FastAPI:
     prefix = settings.api_prefix
     application.include_router(engines.router, prefix=prefix)
     application.include_router(factor_analysis.router, prefix=prefix)
+    application.include_router(market_data.router, prefix=prefix)
     application.include_router(backtests.router, prefix=prefix)
     application.include_router(experiments.router, prefix=prefix)
     application.include_router(comparisons.router, prefix=prefix)

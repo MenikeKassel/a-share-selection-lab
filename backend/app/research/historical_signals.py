@@ -62,6 +62,10 @@ class HistoricalSignalGenerator:
     strategy_version = DailySelectionPipeline.strategy_version
     factor_version = DailySelectionPipeline.factor_version
     information_cutoff = time(18, 30)
+    # FactorPipeline materialises one audit row per factor and security.  Keep
+    # the cross-sectional work bounded while preserving exactly the same
+    # per-date normalisation and ranking semantics.
+    cross_section_batch_days = 5
 
     def generate(
         self,
@@ -118,15 +122,68 @@ class HistoricalSignalGenerator:
                 "state_history": state_history,
             }
         )
+        output_mask = market["date"].between(output_start, output_end)
+        universe_columns = [
+            column
+            for column in (
+                "date",
+                "symbol",
+                "volume",
+                "is_st",
+                "delisting_risk",
+                "suspended",
+                "listing_days",
+            )
+            if column in market
+        ]
+        output_universe = market.loc[output_mask, universe_columns].copy()
+        universe_groups = output_universe.groupby("date", sort=False)
+
+        structure_columns = [
+            column
+            for column in ("date", "symbol", "open", "high", "low", "close", "volume")
+            if column in market
+        ]
+        structure_market = market.loc[:, structure_columns]
+        pa = PriceActionAnalyzer().analyze(structure_market)
+        pa = pa.loc[pa["date"].between(output_start, output_end)].copy()
+        wyckoff = WyckoffCandidateDetector().detect(structure_market)
+        wyckoff_lookup = self._wyckoff_lookup(wyckoff)
+
+        factor_market = market.drop(
+            columns=[
+                "name",
+                "pre_close",
+                "change",
+                "pct_chg",
+                "adj_factor",
+                "first_adj",
+                "adj_open",
+                "adj_high",
+                "adj_low",
+                "adj_close",
+                "adj_pre_close",
+                "execution_open",
+                "execution_high",
+                "execution_low",
+                "execution_close",
+                "execution_pre_close",
+                "limit_source",
+                "has_minute_data",
+            ],
+            errors="ignore",
+        )
         factors = DailyFactorCalculator().calculate(
-            market,
+            factor_market,
             financials=financials,
             valuations=valuations,
             benchmark=benchmark,
             industry_rps=industry_rps,
+            output_start=output_start.date(),
+            output_end=output_end.date(),
         )
         definitions = [item for item in default_factor_definitions() if item.code in factors]
-        factor_output = FactorPipeline(
+        factor_pipeline = FactorPipeline(
             definitions,
             PipelineConfig(
                 normalization="percentile",
@@ -134,9 +191,9 @@ class HistoricalSignalGenerator:
                 market_cap_neutral="market_cap" in factors,
                 calculation_version=self.factor_version,
             ),
-        ).transform(factors)
+        )
         risk_definitions = [item for item in default_risk_definitions() if item.code in factors]
-        risk_output = (
+        risk_pipeline = (
             FactorPipeline(
                 risk_definitions,
                 PipelineConfig(
@@ -145,79 +202,96 @@ class HistoricalSignalGenerator:
                     market_cap_neutral=False,
                     calculation_version=self.factor_version,
                 ),
-            ).transform(factors)
+            )
             if risk_definitions
             else None
         )
-        ranked = self._ranked_factors(factors, factor_output, risk_output)
-        # Keep all preceding rows for rolling calculations; only emit rows in
-        # the requested output window.  This preserves warm-up history without
-        # allowing a later date to influence an earlier signal.
-        ranked = ranked.loc[
-            (ranked["date"] >= output_start) & (ranked["date"] <= output_end)
-        ].copy()
-        factor_details = self._factor_details(factor_output, risk_output)
-        factor_audit_lookup = self._factor_audit_lookup(factor_details)
-
-        # These analyzers are causal at the output date: PA shifts centered
-        # pivots to their confirmation date, and Wyckoff uses shifted history.
-        pa = PriceActionAnalyzer().analyze(market)
-        pa_lookup = self._pa_lookup(pa)
-        wyckoff = WyckoffCandidateDetector().detect(market)
-        wyckoff_lookup = self._wyckoff_lookup(wyckoff)
 
         signals: list[dict[str, Any]] = []
         rejected: list[dict[str, Any]] = []
-        for signal_date in sorted(ranked["date"].dropna().unique()):
-            date_value = pd.Timestamp(signal_date).normalize()
-            section = ranked.loc[ranked["date"] == date_value].copy()
-            universe = market.loc[market["date"] == date_value]
-            eligible_symbols = DailySelectionPipeline._universe(universe)
-            section = section.loc[section["symbol"].astype(str).isin(eligible_symbols)]
-            section = section.sort_values("composite_score", ascending=False).head(200)
-            for row in section.to_dict(orient="records")[:max_candidates_per_date]:
-                symbol = str(row["symbol"])
-                pa_row = self._pa_row(pa_lookup, date_value, symbol)
-                merged: dict[str, Any] = {
-                    **{str(key): value for key, value in row.items()},
-                    **pa_row,
-                }
-                detail = factor_audit_lookup.get((date_value, symbol), [])
-                merged["factor_audit"] = detail
-                recent_wyckoff = self._recent_wyckoff(wyckoff_lookup, symbol, date_value)
-                merged["wyckoff_candidates"] = recent_wyckoff.to_dict(orient="records")
-                merged["wyckoff_score"] = DailySelectionPipeline._wyckoff_score(recent_wyckoff)
-                hard_gates = DailySelectionPipeline._hard_gates(merged)
-                candidate_score = CandidateScorer().score(
-                    base_daily_score=float(merged.get("composite_score", 0.0)) * 0.7,
-                    pa_score=float(merged.get("pa_score", 0.0) or 0.0),
-                    wyckoff_score=float(merged["wyckoff_score"]),
-                    minute_score=None,
-                    hard_gate_reasons=hard_gates,
-                    risk_penalty=float(merged.get("risk_penalty", 0.0) or 0.0),
-                )
-                merged.update(asdict(candidate_score))
-                merged["selection_date"] = date_value.date().isoformat()
-                merged["signal_date"] = date_value
-                merged["strategy_version"] = self.strategy_version
-                merged["factor_version"] = self.factor_version
-                merged["data_snapshot_version"] = snapshot_version
-                merged["strategy_code"] = self.strategy_code
-                merged["score"] = candidate_score.total_score
-                merged["minute_score"] = None
-                merged["minute_confirmation"] = "unavailable"
-                merged["data_confidence"] = candidate_score.data_confidence
-                merged["hard_gate_reasons"] = hard_gates
-                merged["strategies"] = (
-                    classify_candidate(merged) if candidate_score.eligible else []
-                )
-                merged["point_in_time_cutoff"] = self.information_cutoff.isoformat()
-                safe_value = self._json_safe(merged)
-                safe: dict[str, Any] = safe_value if isinstance(safe_value, dict) else {}
-                if candidate_score.eligible and self.strategy_code in safe["strategies"]:
-                    signals.append(safe)
-                elif hard_gates:
-                    rejected.append(safe)
+        output_dates = [
+            pd.Timestamp(value).normalize() for value in sorted(factors["date"].unique())
+        ]
+        for batch_start in range(0, len(output_dates), self.cross_section_batch_days):
+            batch_dates = output_dates[
+                batch_start : batch_start + self.cross_section_batch_days
+            ]
+            batch_factors = factors.loc[factors["date"].isin(batch_dates)].copy()
+            factor_output = factor_pipeline.transform(batch_factors)
+            risk_output = risk_pipeline.transform(batch_factors) if risk_pipeline else None
+            ranked = self._ranked_factors(batch_factors, factor_output, risk_output)
+
+            ranked_sections: dict[pd.Timestamp, pd.DataFrame] = {}
+            candidate_keys: list[pd.DataFrame] = []
+            for date_value in batch_dates:
+                section = ranked.loc[ranked["date"] == date_value].copy()
+                try:
+                    universe = universe_groups.get_group(date_value)
+                except KeyError:
+                    continue
+                eligible_symbols = DailySelectionPipeline._universe(universe)
+                section = section.loc[section["symbol"].astype(str).isin(eligible_symbols)]
+                section = section.sort_values("composite_score", ascending=False).head(200)
+                ranked_sections[date_value] = section
+                candidate_keys.append(section[["date", "symbol"]])
+            if not candidate_keys:
+                continue
+
+            keys = pd.concat(candidate_keys, ignore_index=True).drop_duplicates()
+            factor_details = self._factor_details(factor_output, risk_output).merge(
+                keys,
+                on=["date", "symbol"],
+                how="inner",
+            )
+            factor_audit_lookup = self._factor_audit_lookup(factor_details)
+            pa_lookup = self._pa_lookup(pa.loc[pa["date"].isin(batch_dates)])
+
+            for date_value, section in ranked_sections.items():
+                for row in section.to_dict(orient="records")[:max_candidates_per_date]:
+                    symbol = str(row["symbol"])
+                    pa_row = self._pa_row(pa_lookup, date_value, symbol)
+                    merged: dict[str, Any] = {
+                        **{str(key): value for key, value in row.items()},
+                        **pa_row,
+                    }
+                    detail = factor_audit_lookup.get((date_value, symbol), [])
+                    merged["factor_audit"] = detail
+                    recent_wyckoff = self._recent_wyckoff(wyckoff_lookup, symbol, date_value)
+                    merged["wyckoff_candidates"] = recent_wyckoff.to_dict(orient="records")
+                    merged["wyckoff_score"] = DailySelectionPipeline._wyckoff_score(
+                        recent_wyckoff
+                    )
+                    hard_gates = DailySelectionPipeline._hard_gates(merged)
+                    candidate_score = CandidateScorer().score(
+                        base_daily_score=float(merged.get("composite_score", 0.0)) * 0.7,
+                        pa_score=float(merged.get("pa_score", 0.0) or 0.0),
+                        wyckoff_score=float(merged["wyckoff_score"]),
+                        minute_score=None,
+                        hard_gate_reasons=hard_gates,
+                        risk_penalty=float(merged.get("risk_penalty", 0.0) or 0.0),
+                    )
+                    merged.update(asdict(candidate_score))
+                    merged["selection_date"] = date_value.date().isoformat()
+                    merged["signal_date"] = date_value
+                    merged["strategy_version"] = self.strategy_version
+                    merged["factor_version"] = self.factor_version
+                    merged["data_snapshot_version"] = snapshot_version
+                    merged["strategy_code"] = self.strategy_code
+                    merged["score"] = candidate_score.total_score
+                    merged["minute_score"] = None
+                    merged["minute_confirmation"] = "unavailable"
+                    merged["data_confidence"] = candidate_score.data_confidence
+                    merged["hard_gate_reasons"] = hard_gates
+                    merged["strategies"] = (
+                        classify_candidate(merged) if candidate_score.eligible else []
+                    )
+                    merged["point_in_time_cutoff"] = self.information_cutoff.isoformat()
+                    safe_value = self._json_safe(merged)
+                    safe: dict[str, Any] = safe_value if isinstance(safe_value, dict) else {}
+                    if candidate_score.eligible and self.strategy_code in safe["strategies"]:
+                        signals.append(safe)
+                    elif hard_gates:
+                        rejected.append(safe)
 
         output_columns = self._output_columns()
         signal_frame = self._frame(signals, output_columns)
@@ -271,8 +345,27 @@ class HistoricalSignalGenerator:
         market["symbol"] = market["symbol"].astype(str)
         if market.duplicated(["date", "symbol"]).any():
             raise ValueError("historical daily input contains duplicate date/symbol rows")
+        # The purchased archive keeps raw prices for execution and causal
+        # adjusted prices for research.  Never overwrite the execution frame
+        # outside this generator; the formal engine receives the raw columns.
+        adjusted = {
+            column: f"adj_{column}"
+            for column in ("open", "high", "low", "close", "pre_close")
+            if column in market.columns and f"adj_{column}" in market.columns
+        }
+        core_adjusted = {"open", "high", "low", "close"}.issubset(adjusted)
+        if core_adjusted:
+            for column, adjusted_column in adjusted.items():
+                market[f"execution_{column}"] = market[column]
+                market[column] = pd.to_numeric(market[adjusted_column], errors="coerce")
+            market["price_basis"] = "causal_hfq"
+        else:
+            market["price_basis"] = "raw"
         if state_history is not None and not state_history.empty:
             market = join_historical_state(market, state_history)
+        if "list_date" in market:
+            list_dates = pd.to_datetime(market["list_date"], format="mixed", errors="coerce")
+            market["listing_days"] = (market["date"] - list_dates).dt.days.astype(float)
         return market.sort_values(["date", "symbol"]).reset_index(drop=True)
 
     @staticmethod
@@ -378,8 +471,7 @@ class HistoricalSignalGenerator:
         if wyckoff.empty:
             return {}
         return {
-            str(symbol): group.copy()
-            for symbol, group in wyckoff.groupby("symbol", sort=False)
+            str(symbol): group.copy() for symbol, group in wyckoff.groupby("symbol", sort=False)
         }
 
     @staticmethod
@@ -393,8 +485,7 @@ class HistoricalSignalGenerator:
             return pd.DataFrame(columns=WYCKOFF_COLUMNS)
         dates = pd.to_datetime(symbol_frame["signal_date"], format="mixed", errors="coerce")
         result = symbol_frame.loc[
-            (dates <= signal_date)
-            & (dates >= signal_date - pd.Timedelta(days=20))
+            (dates <= signal_date) & (dates >= signal_date - pd.Timedelta(days=20))
         ].copy()
         return pd.DataFrame(result)
 
@@ -403,6 +494,7 @@ class HistoricalSignalGenerator:
         return [
             "signal_date",
             "symbol",
+            "industry",
             "score",
             "composite_score",
             "return_20d",
@@ -412,6 +504,7 @@ class HistoricalSignalGenerator:
             "strategy_version",
             "factor_version",
             "data_snapshot_version",
+            "price_basis",
             "factor_audit",
             "hard_gate_reasons",
             "data_confidence",
@@ -423,6 +516,10 @@ class HistoricalSignalGenerator:
             "pa_score",
             "wyckoff_score",
             "risk_penalty",
+            "data_quality_risk",
+            "is_st",
+            "delisting_risk",
+            "suspended",
             "strategies",
             "point_in_time_cutoff",
         ]

@@ -9,7 +9,10 @@ from app.db.base import Base
 from sqlalchemy import engine_from_config, pool
 
 config = context.config
-config.set_main_option("sqlalchemy.url", get_settings().database_url)
+configured_url = config.get_main_option("sqlalchemy.url")
+if not configured_url or configured_url == "sqlite:///./data/a_share_selection_lab.db":
+    configured_url = get_settings().database_url
+config.set_main_option("sqlalchemy.url", configured_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

@@ -9,6 +9,7 @@ run is persisted as ``blocked`` instead of fabricating a result.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import math
@@ -25,6 +26,7 @@ from app.adapters.io import read_tabular
 from app.adapters.vectorbt.adapter import VectorBTResearchAdapter
 from app.api.schemas import WalkForwardRunRequest
 from app.core.config import Settings
+from app.data.history import join_historical_state
 from app.data.snapshots import (
     SnapshotManifestError,
     audit_snapshot_files,
@@ -138,10 +140,9 @@ class WalkForwardTaskService:
             snapshot,
             minimum_coverage_ratio=self.settings.min_daily_coverage_ratio,
         )
-        if (
-            pd.Timestamp(snapshot_audit["daily_min_date"]) > pd.Timestamp("2018-01-01")
-            or pd.Timestamp(snapshot_audit["daily_max_date"]) < pd.Timestamp("2025-12-31")
-        ):
+        if pd.Timestamp(snapshot_audit["daily_min_date"]) > pd.Timestamp(
+            "2018-01-01"
+        ) or pd.Timestamp(snapshot_audit["daily_max_date"]) < pd.Timestamp("2025-12-31"):
             raise WalkForwardSnapshotError(
                 "snapshot daily data must cover the complete 2018-2025 validation range"
             )
@@ -151,14 +152,34 @@ class WalkForwardTaskService:
             raise WalkForwardSnapshotError("snapshot manifest is missing daily data")
         benchmark = self._read_manifest_frame(manifest, manifest_path, "benchmark")
         financials = self._read_manifest_frame(manifest, manifest_path, "financials")
-        valuations = self._read_manifest_frame(manifest, manifest_path, "valuations")
-        industry = self._read_manifest_frame(manifest, manifest_path, "industry", required=False)
+        valuation_path = snapshot.file("valuations")
+        assert valuation_path is not None
+        valuations: pd.DataFrame | Path = (
+            valuation_path
+            if valuation_path.suffix.lower() == ".parquet"
+            else read_tabular(valuation_path)
+        )
+        industry = self._read_manifest_frame(
+            manifest, manifest_path, "industry_rps", required=False
+        )
+        if industry is None:
+            candidate_industry = self._read_manifest_frame(
+                manifest, manifest_path, "industry", required=False
+            )
+            if candidate_industry is not None and {"date", "industry"}.issubset(
+                candidate_industry.columns
+            ):
+                industry = candidate_industry
         state_history = self._read_manifest_frame(
             manifest, manifest_path, "state_history", required=False
         )
+        if state_history is None or "industry" not in state_history.columns:
+            raise WalkForwardSnapshotError(
+                "snapshot manifest is missing point-in-time historical industry state"
+            )
         if financials is not None:
             validate_point_in_time_frame(financials, name="financials")
-        if valuations is not None:
+        if isinstance(valuations, pd.DataFrame):
             validate_point_in_time_frame(valuations, name="valuations")
         # The generator is intentionally imported at call time so older installs
         # still boot and report a clear blocked run while being upgraded.
@@ -169,13 +190,13 @@ class WalkForwardTaskService:
                 "historical signal generator is not installed"
             ) from error
 
-        generator = HistoricalSignalGenerator()
-        generated = generator.generate(
+        signals, rejected, audit = self._generate_historical_signals(
+            HistoricalSignalGenerator(),
             daily=daily,
             financials=financials,
             valuations=valuations,
             benchmark=benchmark,
-            industry_rps=industry,
+            industry=industry,
             state_history=state_history,
             start_date=payload.start_date,
             end_date=payload.end_date,
@@ -183,15 +204,19 @@ class WalkForwardTaskService:
                 manifest.get("snapshot_id", manifest.get("version", "unknown"))
             ),
         )
-        signals = generated.signals
-        audit = generated.audit
         if signals.empty:
             raise WalkForwardSnapshotError(
                 "historical signal generator produced no eligible signals"
             )
-        prices = daily.copy()
-        prices["date"] = pd.to_datetime(prices["date"]).dt.normalize()
-        prices["symbol"] = prices["symbol"].astype(str)
+        suspensions = self._read_manifest_frame(
+            manifest, manifest_path, "suspensions", required=False
+        )
+        execution_daily = _date_filter(daily, "date", payload.start_date, payload.end_date)
+        prices = self._prepare_execution_prices(
+            execution_daily,
+            state_history=state_history,
+            suspensions=suspensions,
+        )
         splits = generate_annual_walk_forward_splits(
             first_train_year=2018,
             final_test_year=2025,
@@ -221,8 +246,258 @@ class WalkForwardTaskService:
             "factor_results": factor_results,
             "signal_audit": audit,
             "snapshot_audit": snapshot_audit,
+            "data_source_summary": self._data_source_summary(
+                manifest,
+                manifest_path=manifest_path,
+                snapshot_audit=snapshot_audit,
+            ),
             "_signals": signals,
-            "_rejected": generated.rejected,
+            "_rejected": rejected,
+        }
+
+    @staticmethod
+    def _generate_historical_signals(
+        generator: Any,
+        *,
+        daily: pd.DataFrame,
+        financials: pd.DataFrame | None,
+        valuations: pd.DataFrame | Path | None,
+        benchmark: pd.DataFrame | None,
+        industry: pd.DataFrame | None,
+        state_history: pd.DataFrame,
+        start_date: date,
+        end_date: date,
+        data_snapshot_version: str,
+        warmup_trading_days: int = 400,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+        """Replay one calendar year at a time with an explicit warm-up window."""
+
+        daily_dates = pd.to_datetime(daily["date"], format="mixed", errors="raise").dt.normalize()
+        dates = pd.DatetimeIndex(daily_dates.drop_duplicates().sort_values())
+        signal_parts: list[pd.DataFrame] = []
+        rejected_parts: list[pd.DataFrame] = []
+        chunk_audits: list[dict[str, Any]] = []
+        for year in range(start_date.year, end_date.year + 1):
+            output_start = max(start_date, date(year, 1, 1))
+            output_end = min(end_date, date(year, 12, 31))
+            if output_start > output_end:
+                continue
+            first_output = int(dates.searchsorted(pd.Timestamp(output_start), side="left"))
+            warmup_start_index = max(0, first_output - warmup_trading_days)
+            if first_output - warmup_start_index < warmup_trading_days:
+                raise WalkForwardSnapshotError(
+                    f"historical signal chunk {year} has fewer than "
+                    f"{warmup_trading_days} trading days of warm-up data"
+                )
+            chunk_start = dates[warmup_start_index]
+            chunk = daily.loc[
+                (daily_dates >= chunk_start) & (daily_dates <= pd.Timestamp(output_end))
+            ].copy()
+            symbols = set(chunk["symbol"].astype(str))
+            chunk_financials = _slice_point_in_time_input(
+                financials,
+                symbols=symbols,
+                start=pd.Timestamp(chunk_start),
+                end=pd.Timestamp(output_end),
+                cutoff=generator.information_cutoff,
+            )
+            chunk_valuations = _slice_point_in_time_input(
+                valuations,
+                symbols=symbols,
+                start=pd.Timestamp(chunk_start),
+                end=pd.Timestamp(output_end),
+                cutoff=generator.information_cutoff,
+            )
+            chunk_benchmark = _slice_date_input(
+                benchmark,
+                start=pd.Timestamp(chunk_start),
+                end=pd.Timestamp(output_end),
+            )
+            chunk_industry = _slice_research_input(
+                industry,
+                symbols=symbols,
+                start=pd.Timestamp(chunk_start),
+                end=pd.Timestamp(output_end),
+            )
+            chunk_state = _slice_effective_state(
+                state_history,
+                symbols=symbols,
+                start=pd.Timestamp(chunk_start),
+                end=pd.Timestamp(output_end),
+            )
+            generated = generator.generate(
+                daily=chunk,
+                financials=chunk_financials,
+                valuations=chunk_valuations,
+                benchmark=chunk_benchmark,
+                industry_rps=chunk_industry,
+                state_history=chunk_state,
+                start_date=output_start,
+                end_date=output_end,
+                data_snapshot_version=data_snapshot_version,
+            )
+            if not generated.signals.empty:
+                signal_parts.append(generated.signals)
+            if not generated.rejected.empty:
+                rejected_parts.append(generated.rejected)
+            chunk_audits.append(
+                {
+                    "year": year,
+                    "warmup_start": chunk_start.date().isoformat(),
+                    "output_start": output_start.isoformat(),
+                    "output_end": output_end.isoformat(),
+                    "warmup_trading_days": first_output - warmup_start_index,
+                    "daily_row_count": len(chunk),
+                    "financial_row_count": _frame_length(chunk_financials),
+                    "valuation_row_count": _frame_length(chunk_valuations),
+                    "state_row_count": _frame_length(chunk_state),
+                    "signal_row_count": len(generated.signals),
+                    "rejected_row_count": len(generated.rejected),
+                }
+            )
+            del (
+                chunk,
+                chunk_financials,
+                chunk_valuations,
+                chunk_benchmark,
+                chunk_industry,
+                chunk_state,
+                generated,
+            )
+            gc.collect()
+        signals = pd.concat(signal_parts, ignore_index=True) if signal_parts else pd.DataFrame()
+        rejected = (
+            pd.concat(rejected_parts, ignore_index=True) if rejected_parts else pd.DataFrame()
+        )
+        if not signals.empty:
+            signals = signals.sort_values(["signal_date", "symbol"]).reset_index(drop=True)
+        if not rejected.empty:
+            rejected = rejected.sort_values(["signal_date", "symbol"]).reset_index(drop=True)
+        audit = {
+            "snapshot_version": data_snapshot_version,
+            "strategy_code": generator.strategy_code,
+            "strategy_version": generator.strategy_version,
+            "factor_version": generator.factor_version,
+            "point_in_time_cutoff": generator.information_cutoff.isoformat(),
+            "daily_min_date": dates.min().date().isoformat(),
+            "daily_max_date": dates.max().date().isoformat(),
+            "daily_row_count": len(daily),
+            "daily_symbol_count": int(daily["symbol"].astype(str).nunique()),
+            "signal_row_count": len(signals),
+            "rejected_row_count": len(rejected),
+            "warmup_trading_days": warmup_trading_days,
+            "chunk_count": len(chunk_audits),
+            "chunks": chunk_audits,
+            "production_enabled": False,
+        }
+        return signals, rejected, audit
+
+    @staticmethod
+    def _prepare_execution_prices(
+        daily: pd.DataFrame,
+        *,
+        state_history: pd.DataFrame | None,
+        suspensions: pd.DataFrame | None,
+    ) -> pd.DataFrame:
+        """Build the formal engine's raw-price view without future state leakage."""
+
+        execution_columns = [
+            column
+            for column in (
+                "date",
+                "symbol",
+                "open",
+                "close",
+                "volume",
+                "adj_factor",
+                "cash_dividend_per_share",
+                "industry",
+                "is_st",
+                "delisting_risk",
+                "suspended",
+                "limit_up",
+                "limit_down",
+                "one_word_limit_up",
+                "one_word_limit_down",
+            )
+            if column in daily
+        ]
+        prices = daily.loc[:, execution_columns].copy()
+        prices["date"] = pd.to_datetime(
+            prices["date"], format="mixed", errors="raise"
+        ).dt.normalize()
+        prices["symbol"] = prices["symbol"].astype(str)
+        if state_history is not None and not state_history.empty:
+            prices = join_historical_state(prices, state_history)
+        if "list_date" in prices:
+            list_dates = pd.to_datetime(prices["list_date"], format="mixed", errors="coerce")
+            prices["listing_days"] = (prices["date"] - list_dates).dt.days.astype(float)
+        if suspensions is not None and not suspensions.empty:
+            required = {"date", "symbol"}
+            if required.issubset(suspensions.columns):
+                blocked = suspensions.loc[:, ["date", "symbol"]].copy()
+                blocked["date"] = pd.to_datetime(
+                    blocked["date"], format="mixed", errors="coerce"
+                ).dt.normalize()
+                blocked["symbol"] = blocked["symbol"].astype(str)
+                blocked["_suspended_external"] = True
+                prices = prices.merge(blocked.drop_duplicates(), on=["date", "symbol"], how="left")
+                existing_suspension = (
+                    prices["suspended"]
+                    if "suspended" in prices
+                    else pd.Series(False, index=prices.index)
+                )
+                prices["suspended"] = existing_suspension.fillna(False).astype(bool) | prices[
+                    "_suspended_external"
+                ].fillna(False).astype(bool)
+                prices = prices.drop(columns=["_suspended_external"])
+        for column, default in (
+            ("industry", "unknown"),
+            ("is_st", False),
+            ("delisting_risk", False),
+            ("suspended", False),
+        ):
+            if column not in prices:
+                prices[column] = default
+            else:
+                prices[column] = prices[column].fillna(default)
+        result_columns = [
+            column
+            for column in execution_columns
+            if column in prices
+        ]
+        for column in ("industry", "is_st", "delisting_risk", "suspended"):
+            if column in prices and column not in result_columns:
+                result_columns.append(column)
+        return prices.loc[:, result_columns].sort_values(["date", "symbol"]).reset_index(
+            drop=True
+        )
+
+    @staticmethod
+    def _data_source_summary(
+        manifest: dict[str, Any],
+        *,
+        manifest_path: Path,
+        snapshot_audit: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Expose safe provenance metadata while keeping local paths private."""
+
+        source = manifest.get("source", {})
+        supplement = manifest.get("supplement", {})
+        return {
+            "type": source.get("type", "imported_snapshot"),
+            "read_only": bool(source.get("read_only", True)),
+            "snapshot_id": manifest.get("snapshot_id", manifest.get("version")),
+            "warmup_start": manifest.get("date_range", {}).get("warmup_start"),
+            "validation_start": manifest.get("date_range", {}).get("validation_start"),
+            "validation_end": manifest.get("date_range", {}).get("validation_end"),
+            "manifest_name": manifest_path.name,
+            "price_conventions": manifest.get("price_conventions", {}),
+            "minute_confirmation": "unavailable",
+            "data_confidence": "reduced",
+            "supplement_provider": supplement.get("provider"),
+            "supplement_required_ready": supplement.get("required_ready"),
+            "daily_coverage_ratio": snapshot_audit.get("daily_coverage_ratio"),
         }
 
     @staticmethod
@@ -374,7 +649,9 @@ class WalkForwardTaskService:
                 )
                 try:
                     result = NativeFactorAnalysisEngine().analyze_frames(request, subset, prices)
-                    rows.append({"window": test_start.year, "factor_code": code, **asdict(result)})
+                    result_row = asdict(result)
+                    result_row["factor_code"] = code
+                    rows.append({"window": test_start.year, **result_row})
                 except (ValueError, KeyError):
                     rows.append(
                         {
@@ -394,8 +671,14 @@ class WalkForwardTaskService:
             bool(item.get("test_metrics", {}).get("composite_rank_ic_positive", False))
             for item in windows
         ]
-        stress_excess = sum(
-            float(item["stress_10bps"].get("tradable_excess_return", 0.0)) for item in windows
+        stress_strategy_returns = [
+            float(item["stress_10bps"].get("tradable_return", 0.0)) for item in windows
+        ]
+        stress_benchmark_returns = [
+            float(item["stress_10bps"].get("benchmark_return", 0.0)) for item in windows
+        ]
+        stress_excess = _compound_returns(stress_strategy_returns) - _compound_returns(
+            stress_benchmark_returns
         )
         closed_trades = sum(
             int(item["test_metrics"].get("closed_trade_count", 0)) for item in windows
@@ -405,35 +688,27 @@ class WalkForwardTaskService:
             for item in windows
             for neighbor in item.get("nearby_parameters", [])
         ]
-        positive_pnl = sum(
-            max(float(item["test_metrics"].get("tradable_return", 0.0)), 0.0) for item in windows
+        positive_trade_pnls = [
+            float(pnl)
+            for item in windows
+            for pnl in item["test_metrics"].get("positive_trade_pnls", [])
+            if float(pnl) > 0
+        ]
+        positive_pnl = sum(positive_trade_pnls)
+        top5 = sum(sorted(positive_trade_pnls, reverse=True)[:5])
+        industry_pnl: dict[str, float] = {}
+        for item in windows:
+            for industry, pnl in item["test_metrics"].get("pnl_by_industry", {}).items():
+                industry_pnl[str(industry)] = industry_pnl.get(str(industry), 0.0) + float(pnl)
+        positive_industry_pnl = {key: value for key, value in industry_pnl.items() if value > 0}
+        industry_positive = len(positive_industry_pnl)
+        positive_industry_total = sum(positive_industry_pnl.values())
+        max_industry_share = (
+            max(positive_industry_pnl.values()) / positive_industry_total
+            if positive_industry_total > 0
+            else 1.0
         )
-        top5 = sum(
-            sorted(
-                (
-                    float(
-                        item["test_metrics"]
-                        .get("top_trade_contributions", {})
-                        .get("positive_pnl", 0.0)
-                    )
-                    for item in windows
-                ),
-                reverse=True,
-            )[:5]
-        )
-        industry_positive = sum(
-            int(item["test_metrics"].get("positive_industry_count", 0)) for item in windows
-        )
-        max_industry_share = max(
-            (
-                float(item["test_metrics"].get("max_industry_positive_share", 0.0))
-                for item in windows
-            ),
-            default=0.0,
-        )
-        merged_dd = max(
-            (float(item["test_metrics"].get("max_drawdown", 0.0)) for item in windows), default=0.0
-        )
+        merged_dd = _combined_oos_max_drawdown(windows)
         gates = {
             "positive_tradable_excess_3_of_4": sum(value > 0 for value in excess) >= 3,
             "median_oos_excess_positive": float(np.median(excess)) > 0 if excess else False,
@@ -495,21 +770,22 @@ class WalkForwardTaskService:
             "",
             "## Windows",
             "",
-            "| train | validation | test | selected parameters | tradable return | excess | "
-            "max drawdown | closed trades |",
-            "|---|---|---|---|---:|---:|---:|---:|",
+            "| train | validation | test | selected parameters | failure reason | "
+            "tradable return | excess | max drawdown | closed trades |",
+            "|---|---|---|---|---|---:|---:|---:|---:|",
         ]
         for split in output.get("splits", []):
             metrics = split.get("test_metrics", {})
             lines.append(
                 (
-                    "| {train} | {validation} | {test} | `{params}` | {return_:.4%} | "
-                    "{excess:.4%} | {drawdown:.4%} | {trades} |"
+                    "| {train} | {validation} | {test} | `{params}` | {reason} | "
+                    "{return_:.4%} | {excess:.4%} | {drawdown:.4%} | {trades} |"
                 ).format(
                     train=f"{split.get('train_start')}..{split.get('train_end')}",
                     validation=f"{split.get('validation_start')}..{split.get('validation_end')}",
                     test=f"{split.get('test_start')}..{split.get('test_end')}",
                     params=json.dumps(split.get("selected_parameters", {}), ensure_ascii=False),
+                    reason=str(split.get("failure_reason", "") or ""),
                     return_=float(metrics.get("tradable_return", 0.0)),
                     excess=float(
                         metrics.get("tradable_excess_return", metrics.get("excess_return", 0.0))
@@ -629,6 +905,147 @@ def _date_filter(frame: pd.DataFrame, column: str, start: date, end: date) -> pd
     return frame.loc[(dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))].copy()
 
 
+def _slice_point_in_time_input(
+    source: pd.DataFrame | Path | None,
+    *,
+    symbols: set[str],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    cutoff: Any,
+) -> pd.DataFrame | None:
+    """Read only records that can affect one causal historical replay chunk."""
+
+    if source is None:
+        return None
+    if isinstance(source, Path):
+        if source.suffix.lower() != ".parquet":
+            frame = read_tabular(source)
+        else:
+            import pyarrow.parquet as parquet  # type: ignore[import-untyped]
+
+            schema = parquet.read_schema(source)
+            filters: list[tuple[str, str, Any]] | None = None
+            if "date" in schema.names:
+                filters = [
+                    ("date", ">=", start.normalize().to_pydatetime()),
+                    ("date", "<=", end.normalize().to_pydatetime()),
+                ]
+            frame = pd.read_parquet(source, filters=filters)
+    else:
+        frame = source
+    if frame.empty:
+        return frame.copy()
+    required = {"symbol", "available_at"}
+    if missing := required.difference(frame.columns):
+        raise WalkForwardSnapshotError(
+            f"point-in-time input is missing columns: {sorted(missing)}"
+        )
+    relevant = frame.loc[frame["symbol"].astype(str).isin(symbols)].copy()
+    if relevant.empty:
+        return relevant
+    available = _local_naive_timestamps(relevant["available_at"])
+    start_cutoff = start.normalize() + pd.Timedelta(
+        hours=cutoff.hour,
+        minutes=cutoff.minute,
+        seconds=cutoff.second,
+    )
+    end_cutoff = end.normalize() + pd.Timedelta(
+        hours=cutoff.hour,
+        minutes=cutoff.minute,
+        seconds=cutoff.second,
+    )
+    relevant["_available_sort"] = available
+    prior = (
+        relevant.loc[available < start_cutoff]
+        .sort_values(["symbol", "_available_sort"])
+        .groupby("symbol", sort=False)
+        .tail(1)
+    )
+    current = relevant.loc[available.between(start_cutoff, end_cutoff, inclusive="both")]
+    return (
+        pd.concat([prior, current], ignore_index=True)
+        .sort_values(["symbol", "_available_sort"])
+        .drop(columns=["_available_sort"])
+        .reset_index(drop=True)
+    )
+
+
+def _slice_date_input(
+    frame: pd.DataFrame | None,
+    *,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame | None:
+    if frame is None or frame.empty:
+        return None if frame is None else frame.copy()
+    if "date" not in frame:
+        return frame.copy()
+    dates = _local_naive_timestamps(frame["date"]).dt.normalize()
+    return pd.DataFrame(frame.loc[dates.between(start.normalize(), end.normalize())].copy())
+
+
+def _slice_research_input(
+    frame: pd.DataFrame | None,
+    *,
+    symbols: set[str],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame | None:
+    if frame is None or frame.empty:
+        return None if frame is None else frame.copy()
+    relevant = (
+        frame.loc[frame["symbol"].astype(str).isin(symbols)].copy()
+        if "symbol" in frame
+        else frame.copy()
+    )
+    if "date" in relevant:
+        return _slice_date_input(relevant, start=start, end=end)
+    if "effective_date" in relevant:
+        return _slice_effective_state(relevant, symbols=symbols, start=start, end=end)
+    return relevant
+
+
+def _slice_effective_state(
+    frame: pd.DataFrame | None,
+    *,
+    symbols: set[str],
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+) -> pd.DataFrame | None:
+    if frame is None or frame.empty:
+        return None if frame is None else frame.copy()
+    if not {"symbol", "effective_date"}.issubset(frame.columns):
+        return frame.copy()
+    relevant = frame.loc[frame["symbol"].astype(str).isin(symbols)].copy()
+    effective = _local_naive_timestamps(relevant["effective_date"]).dt.normalize()
+    relevant["_effective_sort"] = effective
+    prior = (
+        relevant.loc[effective < start.normalize()]
+        .sort_values(["symbol", "_effective_sort"])
+        .groupby("symbol", sort=False)
+        .tail(1)
+    )
+    current = relevant.loc[effective.between(start.normalize(), end.normalize())]
+    output = (
+        pd.concat([prior, current], ignore_index=True)
+        .sort_values(["symbol", "_effective_sort"])
+        .drop(columns=["_effective_sort"])
+        .reset_index(drop=True)
+    )
+    return pd.DataFrame(output)
+
+
+def _local_naive_timestamps(values: pd.Series) -> pd.Series:
+    parsed = pd.to_datetime(values, format="mixed", errors="raise")
+    if isinstance(parsed.dtype, pd.DatetimeTZDtype):
+        return parsed.dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
+    return parsed
+
+
+def _frame_length(frame: pd.DataFrame | None) -> int:
+    return 0 if frame is None else len(frame)
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -654,90 +1071,15 @@ def _scan_parameters(
 ) -> list[dict[str, Any]]:
     if prices.empty or signals.empty:
         return []
-    try:
-        return [
-            asdict(item)
-            for item in VectorBTResearchAdapter().run_parameter_scan(
-                prices,
-                signals,
-                grid,
-                initial_cash=initial_cash,
-            )
-        ]
-    except Exception:
-        # A deterministic dependency-free fallback keeps validation fixtures
-        # testable; metadata makes the downgrade explicit to the caller.
-        values: dict[str, list[Any]] = {
-            "top_n": [20],
-            "holding_period": [5],
-            "rebalance_frequency": ["daily"],
-            "commission_rate": [0.0003],
-            "slippage_bps": [5.0],
-            **grid,
-        }
-        output: list[dict[str, Any]] = []
-        for top_n in values["top_n"]:
-            for holding in values["holding_period"]:
-                for frequency in values["rebalance_frequency"]:
-                    for slippage in values["slippage_bps"]:
-                        params = {
-                            "top_n": int(top_n),
-                            "holding_period": int(holding),
-                            "rebalance_frequency": str(frequency),
-                            "commission_rate": float(values["commission_rate"][0]),
-                            "slippage_bps": float(slippage),
-                        }
-                        ret = _research_return(
-                            prices, signals, int(top_n), int(holding), str(frequency)
-                        )
-                        output.append(
-                            {
-                                "parameter_set": params,
-                                "cumulative_return": ret,
-                                "annualized_return": ret,
-                                "max_drawdown": 0.0,
-                                "sharpe": ret,
-                                "turnover": 0.0,
-                                "trade_count": 0,
-                                "win_rate": 0.0,
-                                "metadata": {
-                                    "research_engine": "fallback",
-                                    "formal_ashare_validation": "required",
-                                },
-                            }
-                        )
-        return output
-
-
-def _research_return(
-    prices: pd.DataFrame, signals: pd.DataFrame, top_n: int, holding: int, frequency: str
-) -> float:
-    close = prices.pivot(index="date", columns="symbol", values="close").sort_index()
-    score_dates = sorted(pd.to_datetime(signals["signal_date"]).dt.normalize().unique())
-    if frequency == "weekly":
-        score_dates = list(
-            pd.Series(score_dates).groupby(pd.Series(score_dates).dt.to_period("W-FRI")).max()
+    return [
+        asdict(item)
+        for item in VectorBTResearchAdapter().run_parameter_scan(
+            prices,
+            signals,
+            grid,
+            initial_cash=initial_cash,
         )
-    returns: list[float] = []
-    dates = list(close.index)
-    for signal_date in score_dates:
-        after = [item for item in dates if item > pd.Timestamp(signal_date)]
-        if not after:
-            continue
-        entry = after[0]
-        index = dates.index(entry)
-        exit_date = dates[min(index + holding, len(dates) - 1)]
-        selected = signals.loc[
-            pd.to_datetime(signals["signal_date"]).dt.normalize() == pd.Timestamp(signal_date)
-        ].nlargest(top_n, "score")["symbol"]
-        for symbol in selected:
-            if (
-                symbol in close
-                and pd.notna(close.loc[entry, symbol])
-                and pd.notna(close.loc[exit_date, symbol])
-            ):
-                returns.append(float(close.loc[exit_date, symbol] / close.loc[entry, symbol] - 1.0))
-    return float(np.mean(returns)) if returns else 0.0
+    ]
 
 
 def _formal_run(
@@ -773,6 +1115,8 @@ def _formal_run(
     result = AshareDailyExecutionEngine().run_with_data(request, market, signals)
     performance = dict(result.performance)
     performance.setdefault("execution_failures", result.execution_failures)
+    performance["equity_curve"] = result.equity_curve
+    performance["initial_cash"] = request.initial_cash
     performance["trades"] = result.trades
     performance["positions"] = result.positions
     benchmark_return = _benchmark_return(benchmark)
@@ -794,14 +1138,54 @@ def _empty_formal_metrics() -> dict[str, Any]:
         "excess_return": 0.0,
         "tradable_excess_return": 0.0,
         "max_drawdown": 0.0,
+        "equity_curve": [],
+        "initial_cash": 0.0,
         "trade_count": 0,
         "closed_trade_count": 0,
         "execution_failures": [],
         "composite_rank_ic_positive": False,
         "positive_industry_count": 0,
         "max_industry_positive_share": 1.0,
-        "top_trade_contributions": {"positive_pnl": 0.0},
+        "top_trade_contributions": {"positive_pnl": 0.0, "positive_pnl_total": 0.0},
+        "positive_trade_pnls": [],
+        "pnl_by_industry": {},
     }
+
+
+def _compound_returns(values: list[float]) -> float:
+    compounded = 1.0
+    for value in values:
+        compounded *= 1.0 + value
+    return compounded - 1.0
+
+
+def _combined_oos_max_drawdown(windows: list[dict[str, Any]]) -> float:
+    wealth = 1.0
+    combined: list[float] = []
+    for item in windows:
+        metrics = item.get("test_metrics", {})
+        curve = metrics.get("equity_curve", [])
+        if not isinstance(curve, list) or not curve:
+            continue
+        initial_cash = float(metrics.get("initial_cash", 0.0))
+        if initial_cash <= 0:
+            initial_cash = float(curve[0].get("equity", 0.0))
+        if initial_cash <= 0:
+            continue
+        normalized = [
+            float(point.get("equity", 0.0)) / initial_cash
+            for point in curve
+            if float(point.get("equity", 0.0)) >= 0
+        ]
+        if not normalized:
+            continue
+        combined.extend(wealth * value for value in normalized)
+        wealth = combined[-1]
+    if not combined:
+        return 0.0
+    series = pd.Series(combined, dtype=float)
+    drawdown = series / series.cummax() - 1.0
+    return abs(float(drawdown.min()))
 
 
 def _benchmark_return(benchmark: pd.DataFrame | None) -> float:
@@ -855,7 +1239,23 @@ def _rank_ic_positive(signals: pd.DataFrame, market: pd.DataFrame) -> bool:
 
 def _trade_concentration(trades: list[dict[str, Any]], market: pd.DataFrame) -> dict[str, Any]:
     buys: dict[str, list[dict[str, Any]]] = {}
-    pnl_by_symbol: dict[str, float] = {}
+    closed_trade_pnls: list[float] = []
+    industry_pnl: dict[str, float] = {}
+    market_frame = market.copy()
+    market_frame["date"] = pd.to_datetime(market_frame["date"], errors="coerce").dt.normalize()
+    market_frame["symbol"] = market_frame["symbol"].astype(str)
+    industry_by_key = (
+        market_frame.drop_duplicates(["date", "symbol"], keep="last")
+        .set_index(["date", "symbol"])
+        .get("industry", pd.Series(dtype=str))
+        .to_dict()
+    )
+    industry_by_symbol = (
+        market_frame.drop_duplicates("symbol", keep="last")
+        .set_index("symbol")
+        .get("industry", pd.Series(dtype=str))
+        .to_dict()
+    )
     for trade in trades:
         symbol = str(trade.get("symbol", ""))
         if trade.get("side") == "buy":
@@ -864,27 +1264,47 @@ def _trade_concentration(trades: list[dict[str, Any]], market: pd.DataFrame) -> 
         if trade.get("side") != "sell" or not buys.get(symbol):
             continue
         buy = buys[symbol].pop(0)
+        buy_gross = float(buy.get("gross_amount", 0.0))
+        sell_gross = float(trade.get("gross_amount", 0.0))
+        if buy_gross == 0.0:
+            buy_gross = float(buy.get("price", 0.0)) * float(buy.get("quantity", 0.0))
+        if sell_gross == 0.0:
+            sell_gross = float(trade.get("price", 0.0)) * float(trade.get("quantity", 0.0))
         pnl = (
-            (float(trade.get("price", 0.0)) - float(buy.get("price", 0.0)))
-            * float(min(trade.get("quantity", 0), buy.get("quantity", 0)))
+            sell_gross
             - float(trade.get("commission", 0.0))
             - float(trade.get("stamp_tax", 0.0))
+            - buy_gross
+            - float(buy.get("commission", 0.0))
+            - float(buy.get("stamp_tax", 0.0))
         )
-        pnl_by_symbol[symbol] = pnl_by_symbol.get(symbol, 0.0) + pnl
-    positive = {symbol: value for symbol, value in pnl_by_symbol.items() if value > 0}
-    positive_total = sum(positive.values())
-    industries = market.set_index("symbol").get("industry", pd.Series(dtype=str)).to_dict()
-    industry_pnl: dict[str, float] = {}
-    for symbol, value in positive.items():
-        industry = str(industries.get(symbol, "unknown"))
-        industry_pnl[industry] = industry_pnl.get(industry, 0.0) + value
+        closed_trade_pnls.append(pnl)
+        try:
+            trade_day: pd.Timestamp | None = pd.Timestamp(
+                str(trade.get("trade_date", ""))
+            ).normalize()
+        except (TypeError, ValueError):
+            trade_day = None
+        industry_value = industry_by_symbol.get(symbol, "unknown")
+        if trade_day is not None:
+            industry_value = industry_by_key.get((trade_day, symbol), industry_value)
+        industry = str(industry_value)
+        industry_pnl[industry] = industry_pnl.get(industry, 0.0) + pnl
+    positive = [value for value in closed_trade_pnls if value > 0]
+    positive_total = sum(positive)
+    positive_industry_pnl = {key: value for key, value in industry_pnl.items() if value > 0}
+    positive_industry_total = sum(positive_industry_pnl.values())
     return {
-        "positive_industry_count": sum(value > 0 for value in industry_pnl.values()),
+        "positive_industry_count": len(positive_industry_pnl),
         "max_industry_positive_share": (
-            max(industry_pnl.values()) / positive_total if positive_total > 0 else 1.0
+            max(positive_industry_pnl.values()) / positive_industry_total
+            if positive_industry_total > 0
+            else 1.0
         ),
+        "positive_trade_pnls": positive,
+        "pnl_by_industry": industry_pnl,
         "top_trade_contributions": {
-            "positive_pnl": sum(sorted(positive.values(), reverse=True)[:5]),
+            "positive_pnl": sum(sorted(positive, reverse=True)[:5]),
             "positive_pnl_total": positive_total,
         },
     }

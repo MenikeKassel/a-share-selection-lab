@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+from datetime import date
 from pathlib import Path
 
 import uvicorn
@@ -30,6 +32,31 @@ def main() -> None:
         "--output-root",
         type=Path,
         default=Path("./data/experiments/first"),
+    )
+    probe = subparsers.add_parser(
+        "probe-supplement-provider",
+        help="probe the isolated TinyShare supplementary data provider",
+    )
+    probe.add_argument("--python", dest="python_executable", type=Path, default=None)
+    purchased = subparsers.add_parser(
+        "import-purchased-snapshot",
+        help="import the read-only purchased CSV archive into an immutable snapshot",
+    )
+    purchased.add_argument("--source", type=Path, required=True)
+    purchased.add_argument("--snapshot-root", type=Path, default=Path("./data/raw/imports"))
+    purchased.add_argument("--snapshot-id", default="ashare-2018-2025-v1")
+    purchased.add_argument("--start-date", type=date.fromisoformat, default=date(2016, 1, 1))
+    purchased.add_argument("--end-date", type=date.fromisoformat, default=date(2025, 12, 31))
+    purchased.add_argument("--supplement-tinyshare", action="store_true")
+    walk = subparsers.add_parser(
+        "run-walk-forward",
+        help="run the immutable trend_quality_v1 walk-forward experiment",
+    )
+    walk.add_argument("--experiment-code", default="trend-quality-wf-2018-2025-purchased-v1")
+    walk.add_argument(
+        "--manifest",
+        type=Path,
+        default=Path("./data/raw/imports/ashare-2018-2025-v1/manifest.json"),
     )
     args = parser.parse_args()
     if args.command == "engines":
@@ -71,6 +98,96 @@ def main() -> None:
                 indent=2,
             )
         )
+        return
+    if args.command == "probe-supplement-provider":
+        from app.adapters.market_data.tinyshare import (
+            TinyShareIsolatedClient,
+            TinyShareProviderError,
+        )
+        from app.adapters.market_data.tinyshare.supplement import TinyShareSnapshotCompleter
+
+        client = TinyShareIsolatedClient(python_executable=args.python_executable)
+        completer = TinyShareSnapshotCompleter(client)
+        capabilities = completer.probe()
+        try:
+            package_info = client.package_info()
+        except TinyShareProviderError as error:
+            package_info = {"available": False, "error": str(error)}
+        print(
+            json.dumps(
+                {
+                    "provider": "tinyshare",
+                    "configured": bool(os.getenv("TINYSHARE_TOKEN")),
+                    "package": package_info,
+                    "capabilities": [item.as_dict() for item in capabilities],
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+    if args.command == "import-purchased-snapshot":
+        from app.adapters.market_data.purchased_csv import (
+            PurchasedCsvSnapshotImporter,
+            PurchasedCsvSnapshotResult,
+        )
+
+        snapshot_directory = (args.snapshot_root / args.snapshot_id).expanduser().resolve()
+        importer = PurchasedCsvSnapshotImporter(
+            source_dir=args.source,
+            snapshot_root=args.snapshot_root,
+            snapshot_id=args.snapshot_id,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        )
+        import_result: PurchasedCsvSnapshotResult | None = None
+        manifest_path = snapshot_directory / "manifest.json"
+        if not (args.supplement_tinyshare and manifest_path.exists()):
+            import_result = importer.run()
+            manifest_path = import_result.manifest_path
+        payload: dict[str, object] = {
+            "snapshot_id": args.snapshot_id,
+            "manifest_path": str(manifest_path),
+        }
+        if import_result is not None:
+            payload.update(
+                {
+                    "daily_path": str(import_result.daily_path),
+                    "row_count": import_result.row_count,
+                    "symbol_count": import_result.symbol_count,
+                    "date_range": [
+                        import_result.min_date.isoformat(),
+                        import_result.max_date.isoformat(),
+                    ],
+                }
+            )
+        if args.supplement_tinyshare:
+            from app.adapters.market_data.tinyshare import TinyShareIsolatedClient
+            from app.adapters.market_data.tinyshare.supplement import TinyShareSnapshotCompleter
+
+            payload["supplement"] = TinyShareSnapshotCompleter(TinyShareIsolatedClient()).complete(
+                manifest_path.parent,
+                start_date=args.start_date,
+                end_date=args.end_date,
+            )
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+        return
+    if args.command == "run-walk-forward":
+        from app.api.schemas import WalkForwardRunRequest
+        from app.api.serializers import walk_forward_dict
+        from app.db.session import create_session_factory, initialize_database
+        from app.services.walk_forward import WalkForwardTaskService
+
+        initialize_database()
+        settings = get_settings()
+        with create_session_factory()() as session:
+            record = WalkForwardTaskService(session, settings).run(
+                WalkForwardRunRequest(
+                    experiment_code=args.experiment_code,
+                    snapshot_manifest_path=str(args.manifest),
+                )
+            )
+        print(json.dumps(walk_forward_dict(record), ensure_ascii=False, indent=2, default=str))
         return
     settings = get_settings()
     uvicorn.run(

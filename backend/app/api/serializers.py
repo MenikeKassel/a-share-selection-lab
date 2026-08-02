@@ -89,6 +89,8 @@ def walk_forward_dict(record: Any) -> dict[str, Any]:
         "research_engine": result.get("research_engine", "vectorbt"),
         "formal_ashare_validation": result.get("formal_ashare_validation", "required"),
         "factor_version": result.get("factor_version", "transparent_factor_v1"),
+        "snapshot_audit": result.get("snapshot_audit", {}),
+        "data_source_summary": result.get("data_source_summary", {}),
         "artifact_path": record.artifact_path,
         "status": record.status,
         "lifecycle_status": record.lifecycle_status,
