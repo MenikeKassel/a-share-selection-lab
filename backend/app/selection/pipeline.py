@@ -309,7 +309,13 @@ class DailySelectionPipeline:
             if column in eligible:
                 eligible = eligible.loc[~eligible[column].eq(True)]
         if "listing_days" in eligible:
-            eligible = eligible.loc[eligible["listing_days"].fillna(0) >= 60]
+            # PR 5: listing_days is only meaningful when derived from a real
+            # security master.  All-NaN means no real listing dates were
+            # available (importer writes NaN) -> skip the new-listing filter
+            # rather than dropping the whole universe via fillna(0).
+            listing_days = pd.to_numeric(eligible["listing_days"], errors="coerce")
+            if listing_days.notna().any():
+                eligible = eligible.loc[listing_days.fillna(0) >= 60]
         eligible = eligible.loc[eligible["volume"].fillna(0) > 0]
         return eligible["symbol"].astype(str).tolist()
 

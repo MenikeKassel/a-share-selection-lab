@@ -203,6 +203,7 @@ class PurchasedCsvSnapshotImporter:
         manifest = {
             "snapshot_id": self.snapshot_id,
             "version": self.snapshot_id,
+            "schema_version": 2,
             "status": "staged",
             "immutable": True,
             "audit_valid": False,
@@ -210,6 +211,15 @@ class PurchasedCsvSnapshotImporter:
             "daily_coverage_ratio": 0.0,
             "information_cutoff": "18:30:00",
             "point_in_time_cutoff": "18:30:00",
+            "capabilities": {
+                "historical_security_master": False,
+                "historical_security_state": False,
+                "pit_cutoff_enforced": False,
+                "real_listing_dates": False,
+                "explicit_corporate_actions": False,
+                "total_return_proxy_available": True,
+                "open_tradability_model": "daily_conservative",
+            },
             "source": {
                 "type": "purchased_csv_archive",
                 "path": str(self.source_dir),
@@ -264,7 +274,10 @@ class PurchasedCsvSnapshotImporter:
     def _read_file(self, path: Path) -> Iterator[pd.DataFrame]:
         try:
             first_row = pd.read_csv(path, usecols=["trade_date"], nrows=1, dtype="string")
-            file_start = pd.to_datetime(
+            # Defensive: reject unreadable/empty first dates early.  The
+            # value itself is no longer used (PR 5: listing_days comes from
+            # the security master, not the CSV window start).
+            pd.to_datetime(
                 first_row["trade_date"].iloc[0], format="%Y%m%d", errors="raise"
             ).normalize()
         except (OSError, ValueError, IndexError, pd.errors.ParserError) as error:
@@ -344,7 +357,11 @@ class PurchasedCsvSnapshotImporter:
             frame["limit_down"] = frame["close_at_limit_down"]
             frame["limit_source"] = "derived_from_raw_daily"
             frame["has_minute_data"] = False
-            frame["listing_days"] = (frame["date"] - file_start).dt.days.astype(float)
+            # PR 5: real listing dates come from the purchased security
+            # master, not the CSV window.  Leave NaN here; the snapshot
+            # capability gate reports real_listing_dates and downstream
+            # walk-forward computes listing_days from the master.
+            frame["listing_days"] = np.nan
             yield frame[
                 [
                     "date",
