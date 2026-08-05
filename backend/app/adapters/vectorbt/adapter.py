@@ -77,7 +77,8 @@ class VectorBTResearchAdapter:
             rebalance_frequency=parameter_set.rebalance_frequency,
         )
         portfolio = vbt.Portfolio.from_signals(
-            signal.close,
+            signal.valuation_close,
+            open=signal.execution_open,
             entries=signal.entries,
             exits=signal.exits,
             init_cash=initial_cash,

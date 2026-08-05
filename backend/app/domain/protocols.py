@@ -57,6 +57,7 @@ class BacktestRequest:
     max_industry_weight: float = 0.3
     market_data_path: str | None = None
     signal_path: str | None = None
+    execution_policy: str = "daily_conservative"
 
 
 @dataclass(frozen=True, slots=True)

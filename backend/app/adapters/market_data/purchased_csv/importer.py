@@ -17,6 +17,8 @@ import pandas as pd
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
+from app.market_rules.price_limits import price_limit_ratio
+
 
 class PurchasedCsvImportError(RuntimeError):
     """The purchased archive cannot be imported safely."""
@@ -311,9 +313,39 @@ class PurchasedCsvSnapshotImporter:
             frame["is_st"] = frame["name"].map(lambda value: bool(_ST_RE.search(value)))
             frame["delisting_risk"] = frame["name"].str.contains("退", regex=False, na=False)
             frame["suspended"] = frame["volume"].fillna(0).le(0)
-            frame["limit_up"], frame["limit_down"] = _derive_limit_flags(frame)
-            frame["one_word_limit_up"] = frame["limit_up"] & _one_word(frame)
-            frame["one_word_limit_down"] = frame["limit_down"] & _one_word(frame)
+            # PR 2: close-time limit flags come from the versioned rule table;
+            # open-time flags only know the open price.  close_* fields are
+            # close-time information and MUST NOT gate next-open fills.
+            frame["close_at_limit_up"], frame["close_at_limit_down"] = _derive_limit_flags(
+                frame
+            )
+            frame["one_word_limit_up"] = frame["close_at_limit_up"] & _one_word(frame)
+            frame["one_word_limit_down"] = frame["close_at_limit_down"] & _one_word(frame)
+            open_limit_ratio = frame.apply(
+                lambda row: float(
+                    price_limit_ratio(
+                        str(row["symbol"]),
+                        pd.Timestamp(row["date"]).date(),
+                        is_st=bool(row.get("is_st", False)),
+                    )
+                ),
+                axis=1,
+            )
+            pre_close = frame["pre_close"].replace(0, np.nan)
+            tolerance = pre_close * 0.0015
+            open_limit_up = pre_close * (1.0 + open_limit_ratio)
+            open_limit_down = pre_close * (1.0 - open_limit_ratio)
+            frame["open_at_limit_up"] = (
+                frame["open"].fillna(np.nan) >= open_limit_up - tolerance
+            )
+            frame["open_at_limit_down"] = (
+                frame["open"].fillna(np.nan) <= open_limit_down + tolerance
+            )
+            frame["price_limit_rule_version"] = "a_share_daily_v2"
+            # Deprecated aliases retained for downstream compat; the v2
+            # engine ignores them for open-time decisions.
+            frame["limit_up"] = frame["close_at_limit_up"]
+            frame["limit_down"] = frame["close_at_limit_down"]
             frame["limit_source"] = "derived_from_raw_daily"
             frame["has_minute_data"] = False
             frame["listing_days"] = (frame["date"] - file_start).dt.days.astype(float)
@@ -341,10 +373,15 @@ class PurchasedCsvSnapshotImporter:
                     "is_st",
                     "delisting_risk",
                     "suspended",
-                    "limit_up",
-                    "limit_down",
+                    "close_at_limit_up",
+                    "close_at_limit_down",
+                    "open_at_limit_up",
+                    "open_at_limit_down",
                     "one_word_limit_up",
                     "one_word_limit_down",
+                    "price_limit_rule_version",
+                    "limit_up",
+                    "limit_down",
                     "limit_source",
                     "has_minute_data",
                     "listing_days",
@@ -363,14 +400,14 @@ class PurchasedCsvSnapshotImporter:
 
 
 def _derive_limit_flags(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
-    code = frame["symbol"].astype(str).str.slice(0, 3)
-    is_st = frame["is_st"].astype(bool)
-    threshold = pd.Series(0.10, index=frame.index)
-    threshold = threshold.where(~code.isin({"300", "688"}), 0.20)
-    threshold = threshold.where(~code.str.startswith("8") & ~code.str.startswith("4"), 0.30)
-    threshold = threshold.where(~is_st, 0.05)
-    pct = frame["pct_chg"] / 100.0
-    return pct >= threshold - 0.0015, pct <= -threshold + 0.0015
+    """Close-at-limit flags from the versioned rule table (PR 2.4).
+
+    Deprecated legacy signature kept for import-time callers; the rule
+    lookup now lives in ``app.market_rules.price_limits``.
+    """
+    from app.market_rules.price_limits import derive_limit_flags
+
+    return derive_limit_flags(frame)
 
 
 def _one_word(frame: pd.DataFrame) -> pd.Series:

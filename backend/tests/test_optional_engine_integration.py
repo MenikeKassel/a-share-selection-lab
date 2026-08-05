@@ -65,6 +65,7 @@ def test_vectorbt_adapter_runs_a_real_parameter_case() -> None:
             {
                 "date": trade_date,
                 "symbol": symbol,
+                "open": 10.0 + day_index * (0.2 if symbol == "A" else -0.1),
                 "close": 10.0 + day_index * (0.2 if symbol == "A" else -0.1),
             }
             for day_index, trade_date in enumerate(dates)

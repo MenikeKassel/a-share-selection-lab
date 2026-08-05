@@ -9,12 +9,12 @@ from app.services.walk_forward import WalkForwardTaskService
 def test_vectorbt_signal_executes_after_signal_date() -> None:
     prices = pd.DataFrame(
         [
-            {"date": "2026-01-02", "symbol": "A", "close": 10.0},
-            {"date": "2026-01-02", "symbol": "B", "close": 10.0},
-            {"date": "2026-01-05", "symbol": "A", "close": 11.0},
-            {"date": "2026-01-05", "symbol": "B", "close": 9.0},
-            {"date": "2026-01-06", "symbol": "A", "close": 12.0},
-            {"date": "2026-01-06", "symbol": "B", "close": 8.0},
+            {"date": "2026-01-02", "symbol": "A", "open": 10.0, "close": 10.0},
+            {"date": "2026-01-02", "symbol": "B", "open": 10.0, "close": 10.0},
+            {"date": "2026-01-05", "symbol": "A", "open": 11.0, "close": 11.0},
+            {"date": "2026-01-05", "symbol": "B", "open": 9.0, "close": 9.0},
+            {"date": "2026-01-06", "symbol": "A", "open": 12.0, "close": 12.0},
+            {"date": "2026-01-06", "symbol": "B", "open": 8.0, "close": 8.0},
         ]
     )
     scores = pd.DataFrame(

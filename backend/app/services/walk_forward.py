@@ -36,7 +36,7 @@ from app.data.snapshots import (
 )
 from app.db.repositories import WalkForwardRepository
 from app.domain.protocols import BacktestRequest, FactorAnalysisRequest
-from app.execution.ashare_daily import AshareDailyExecutionEngine
+from app.execution.ashare_daily_v2 import AshareDailyV2ProxyEngine
 from app.research.factor_analysis import NativeFactorAnalysisEngine
 from app.research.walk_forward import (
     WalkForwardSplit,
@@ -1476,13 +1476,22 @@ def _formal_run(
         max_stock_weight=payload.max_stock_weight,
         max_industry_weight=payload.max_industry_weight,
     )
-    result = AshareDailyExecutionEngine().run_with_data(request, market, signals)
+    # PR 1/2/4: v8 runs the total-return-proxy v2 engine.  Adj_factor never
+    # changes position quantities, open-time flags gate fills, and every
+    # sell carries realized PnL from the FIFO ledger.  Strict execution
+    # stays blocked (TinyShare corporate-action probe failed; license
+    # expired) and promotion remains disabled.
+    result = AshareDailyV2ProxyEngine().run_with_data(request, market, signals)
     performance = dict(result.performance)
     performance.setdefault("execution_failures", result.execution_failures)
     performance["equity_curve"] = result.equity_curve
     performance["initial_cash"] = request.initial_cash
     performance["trades"] = result.trades
     performance["positions"] = result.positions
+    performance["engine_code"] = result.metadata.get("engine")
+    performance["execution_result_level"] = result.metadata.get("execution_result_level")
+    performance["corporate_action_mode"] = result.metadata.get("corporate_action_mode")
+    performance["execution_confidence"] = result.metadata.get("execution_confidence")
     benchmark_return = _benchmark_return(benchmark)
     tradable_return = float(performance.get("tradable_return", 0.0))
     performance["max_drawdown"] = abs(float(performance.get("max_drawdown", 0.0)))
