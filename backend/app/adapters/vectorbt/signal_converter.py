@@ -102,8 +102,18 @@ def convert_scores_to_signals(
         for symbol in selected:
             entries.loc[execution_date, symbol] = True
             exit_index = min(dates.index(execution_date) + holding_period, len(dates) - 1)
-            if exit_index > dates.index(execution_date):
-                exits.loc[dates[exit_index], symbol] = True
+            if exit_index <= dates.index(execution_date):
+                continue
+            # PR 4.1: roll the exit forward to the next tradable day when
+            # the scheduled day is untradable; never cancel silently.
+            exit_date = dates[exit_index]
+            while not bool(tradable.loc[exit_date, symbol]):
+                exit_index += 1
+                if exit_index >= len(dates):
+                    break
+                exit_date = dates[exit_index]
+            if exit_index < len(dates) and exit_index > dates.index(execution_date):
+                exits.loc[exit_date, symbol] = True
     return VectorBTSignalMatrix(
         execution_open=execution_open,
         valuation_close=valuation_close.ffill(),

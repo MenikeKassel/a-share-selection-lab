@@ -111,3 +111,20 @@ def test_derive_limit_flags_regime_boundary() -> None:
     frame["date"] = "2020-08-24"
     up, _ = derive_limit_flags(frame)
     assert up.tolist() == [False]
+
+
+def test_limit_prices_round_half_up_per_exchange_rule() -> None:
+    # PR 4.1: SSE/SZSE round the theoretical limit price to the nearest
+    # tick with half-up.  pre_close 10.05 at 10% -> raw_up = 11.055,
+    # half-up to the tick gives 11.06 (old ROUND_DOWN gave 11.05).
+    up, _ = limit_prices(Decimal("10.05"), Decimal("0.10"))
+    assert up == Decimal("11.06")
+    # down side: raw_down = 9.045 -> half-up gives 9.05
+    _, down = limit_prices(Decimal("10.05"), Decimal("0.10"))
+    assert down == Decimal("9.05")
+    # pre_close 10.00 -> raw_up 11.00 exact, unchanged
+    up, down = limit_prices(Decimal("10.00"), Decimal("0.10"))
+    assert (up, down) == (Decimal("11.00"), Decimal("9.00"))
+    # pre_close 9.97 -> raw_up = 10.967 -> half-up 10.97
+    up, _ = limit_prices(Decimal("9.97"), Decimal("0.10"))
+    assert up == Decimal("10.97")

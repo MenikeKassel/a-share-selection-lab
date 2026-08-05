@@ -76,11 +76,18 @@ class VectorBTResearchAdapter:
             holding_period=parameter_set.holding_period,
             rebalance_frequency=parameter_set.rebalance_frequency,
         )
+        # PR 4.1: VectorBT fills orders at the 'price' argument, not at
+        # 'open'.  Pass price=execution_open so fills happen at the next
+        # bar's (causal adjusted) open, and restrict entries/exits to
+        # tradable days.
+        effective_entries = signal.entries & signal.tradable_mask
+        effective_exits = signal.exits & signal.tradable_mask
         portfolio = vbt.Portfolio.from_signals(
             signal.valuation_close,
+            price=signal.execution_open,
             open=signal.execution_open,
-            entries=signal.entries,
-            exits=signal.exits,
+            entries=effective_entries,
+            exits=effective_exits,
             init_cash=initial_cash,
             fees=parameter_set.commission_rate,
             slippage=parameter_set.slippage_bps / 10_000.0,

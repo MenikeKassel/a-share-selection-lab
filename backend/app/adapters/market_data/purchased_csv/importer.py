@@ -17,7 +17,7 @@ import pandas as pd
 import pyarrow as pa  # type: ignore[import-untyped]
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 
-from app.market_rules.price_limits import price_limit_ratio
+from app.market_rules.price_limits import limit_prices, price_limit_ratio
 
 
 class PurchasedCsvImportError(RuntimeError):
@@ -321,25 +321,21 @@ class PurchasedCsvSnapshotImporter:
             )
             frame["one_word_limit_up"] = frame["close_at_limit_up"] & _one_word(frame)
             frame["one_word_limit_down"] = frame["close_at_limit_down"] & _one_word(frame)
-            open_limit_ratio = frame.apply(
-                lambda row: float(
-                    price_limit_ratio(
-                        str(row["symbol"]),
-                        pd.Timestamp(row["date"]).date(),
-                        is_st=bool(row.get("is_st", False)),
-                    )
-                ),
+            # PR 4.1: derive limit-up/down prices from the SAME rule table
+            # function used for close flags (single Decimal rounding path).
+            limit_rows = frame.apply(
+                lambda row: _limit_prices_for_row(row),
                 axis=1,
             )
+            frame["limit_up_price"] = [row[0] for row in limit_rows]
+            frame["limit_down_price"] = [row[1] for row in limit_rows]
             pre_close = frame["pre_close"].replace(0, np.nan)
             tolerance = pre_close * 0.0015
-            open_limit_up = pre_close * (1.0 + open_limit_ratio)
-            open_limit_down = pre_close * (1.0 - open_limit_ratio)
             frame["open_at_limit_up"] = (
-                frame["open"].fillna(np.nan) >= open_limit_up - tolerance
+                frame["open"].fillna(np.nan) >= frame["limit_up_price"] - tolerance
             )
             frame["open_at_limit_down"] = (
-                frame["open"].fillna(np.nan) <= open_limit_down + tolerance
+                frame["open"].fillna(np.nan) <= frame["limit_down_price"] + tolerance
             )
             frame["price_limit_rule_version"] = "a_share_daily_v2"
             # Deprecated aliases retained for downstream compat; the v2
@@ -375,6 +371,8 @@ class PurchasedCsvSnapshotImporter:
                     "suspended",
                     "close_at_limit_up",
                     "close_at_limit_down",
+                    "limit_up_price",
+                    "limit_down_price",
                     "open_at_limit_up",
                     "open_at_limit_down",
                     "one_word_limit_up",
@@ -408,6 +406,25 @@ def _derive_limit_flags(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     from app.market_rules.price_limits import derive_limit_flags
 
     return derive_limit_flags(frame)
+
+
+def _limit_prices_for_row(row: pd.Series) -> tuple[float, float]:
+    """One row's (limit_up_price, limit_down_price) via the rule table.
+
+    PR 4.1: single Decimal half-up rounding path shared with close flags.
+    """
+    from decimal import Decimal
+
+    pre_close = Decimal(str(row["pre_close"]))
+    if pre_close <= 0:
+        return 0.0, 0.0
+    ratio = price_limit_ratio(
+        str(row["symbol"]),
+        pd.Timestamp(row["date"]).date(),
+        is_st=bool(row.get("is_st", False)),
+    )
+    up, down = limit_prices(pre_close, ratio)
+    return float(up), float(down)
 
 
 def _one_word(frame: pd.DataFrame) -> pd.Series:

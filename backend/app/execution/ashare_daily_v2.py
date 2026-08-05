@@ -49,7 +49,11 @@ class _Holding:
     industry: str
     last_buy_date: Any
     lots: list[PositionLot]
-    last_price: float = 0.0
+    # PR 4.1: raw and causal-adjusted closes tracked separately.  Proxy
+    # valuation may only fall back on the adjusted close; the raw close is
+    # informational (position history) and must never feed proxy_market_value.
+    last_raw_close: float = 0.0
+    last_adj_close: float = 0.0
 
     @property
     def quantity(self) -> int:
@@ -156,7 +160,7 @@ class AshareDailyV2ProxyEngine:
                         "symbol": symbol,
                         "quantity": holding.quantity,
                         "average_cost": round(self._average_cost(holding), 6),
-                        "close": round(holding.last_price, 6),
+                        "close": round(holding.last_raw_close, 6),
                         "market_value": round(self._market_value_of(day, holding), 4),
                         "industry": holding.industry,
                         "proxy_raw_notional": round(holding.raw_notional, 4),
@@ -293,7 +297,10 @@ class AshareDailyV2ProxyEngine:
                 allocated_buy_commission=commission,
                 unit_cost=(gross + commission) / quantity,
                 industry_at_entry=industry,
-                raw_notional=gross + commission,
+                # PR 4.1: price-only notional so proxy market value does not
+                # inflate by the buy commission; the commission is already
+                # inside unit_cost and was deducted from cash.
+                raw_notional=gross,
                 adj_open=adj_open if adj_open > 0 else float(row["open"]),
             )
             ledger.add_lot(lot)
@@ -303,7 +310,8 @@ class AshareDailyV2ProxyEngine:
                     industry=industry,
                     last_buy_date=trade_date,
                     lots=[lot],
-                    last_price=float(row["open"]),
+                    last_raw_close=float(row["open"]),
+                    last_adj_close=adj_open if adj_open > 0 else float(row["open"]),
                 )
             else:
                 existing.lots.append(lot)
@@ -387,8 +395,11 @@ class AshareDailyV2ProxyEngine:
             "stamp_tax": stamp_tax,
             "realized_pnl": realized_pnl,
             "realized_return": (
-                realized_pnl / (matched_cost + buy_commission_allocated)
-                if matched_cost + buy_commission_allocated > 0
+                # PR 4.1: matched_cost already includes the allocated buy
+                # commission via unit_cost; adding buy_commission_allocated
+                # again would double count the denominator.
+                realized_pnl / matched_cost
+                if matched_cost > 0
                 else 0.0
             ),
             "industry_at_entry": holding.industry,
@@ -459,21 +470,17 @@ class AshareDailyV2ProxyEngine:
         return sum(self._market_value_of(day, holding) for holding in holdings.values())
 
     def _market_value_of(self, day: pd.DataFrame, holding: _Holding) -> float:
+        adj_close = 0.0
         if holding.symbol in day.index:
             row = day.loc[holding.symbol]
             adj_close = self._adj_close(cast(pd.Series, row))
-            if adj_close > 0:
-                return sum(
-                    proxy_market_value(
-                        ProxyLotRecord(
-                            entry_raw_notional=lot.raw_notional,
-                            entry_adj_open=lot.adj_open,
-                            entry_raw_quantity=lot.quantity_remaining,
-                        ),
-                        adj_close,
-                    )
-                    for lot in holding.lots
-                )
+        # PR 4.1: fall back ONLY on the last causal-adjusted close.  The raw
+        # close lives on a different scale after corporate actions and must
+        # never feed proxy valuation.
+        if adj_close <= 0:
+            adj_close = holding.last_adj_close
+        if adj_close <= 0:
+            return 0.0
         return sum(
             proxy_market_value(
                 ProxyLotRecord(
@@ -481,7 +488,7 @@ class AshareDailyV2ProxyEngine:
                     entry_adj_open=lot.adj_open,
                     entry_raw_quantity=lot.quantity_remaining,
                 ),
-                holding.last_price,
+                adj_close,
             )
             for lot in holding.lots
         )
@@ -494,12 +501,6 @@ class AshareDailyV2ProxyEngine:
         return float(value)
 
     @staticmethod
-    def _open_price(day: pd.DataFrame, symbol: str, fallback: float) -> float:
-        if symbol in day.index and pd.notna(day.loc[symbol, "open"]):
-            return float(cast(Any, day.at[symbol, "open"]))
-        return fallback
-
-    @staticmethod
     def _average_cost(holding: _Holding) -> float:
         total = sum(lot.quantity_cost(lot.quantity_remaining) for lot in holding.lots)
         quantity = holding.quantity
@@ -508,8 +509,14 @@ class AshareDailyV2ProxyEngine:
     @staticmethod
     def _mark_positions(day: pd.DataFrame, holdings: dict[str, _Holding]) -> None:
         for holding in holdings.values():
-            if holding.symbol in day.index and pd.notna(day.loc[holding.symbol, "close"]):
-                holding.last_price = float(cast(Any, day.at[holding.symbol, "close"]))
+            if holding.symbol not in day.index:
+                continue
+            row = cast(pd.Series, day.loc[holding.symbol])
+            if pd.notna(row.get("close")):
+                holding.last_raw_close = float(cast(Any, row["close"]))
+            adj_close = AshareDailyV2ProxyEngine._adj_close(row)
+            if adj_close > 0:
+                holding.last_adj_close = adj_close
 
     @staticmethod
     def _targets_by_execution_date(

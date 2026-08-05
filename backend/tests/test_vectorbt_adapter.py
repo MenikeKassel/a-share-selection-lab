@@ -38,6 +38,83 @@ def test_vectorbt_signal_executes_after_signal_date() -> None:
     assert converted.metadata["signal_lag_bars"] == 1
 
 
+@pytest.mark.skipif(not VectorBTResearchAdapter.is_available(), reason="vectorbt is not installed")
+def test_vectorbt_fills_at_next_open_price_in_order_records() -> None:
+    """PR 4.1: VectorBT must execute at the next open, verifiable in the
+    actual order records, not just metadata."""
+    import vectorbt as vbt
+
+    prices = pd.DataFrame(
+        [
+            {"date": "2026-01-02", "symbol": "A", "open": 10.0, "close": 10.0},
+            {"date": "2026-01-05", "symbol": "A", "open": 11.0, "close": 12.0},
+            {"date": "2026-01-06", "symbol": "A", "open": 13.0, "close": 13.0},
+        ]
+    )
+    scores = pd.DataFrame(
+        [{"signal_date": "2026-01-02", "symbol": "A", "score": 90.0}]
+    )
+    signal = convert_scores_to_signals(
+        scores,
+        prices,
+        top_n=1,
+        holding_period=1,
+        rebalance_frequency="daily",
+    )
+    portfolio = vbt.Portfolio.from_signals(
+        signal.valuation_close,
+        price=signal.execution_open,
+        open=signal.execution_open,
+        entries=signal.entries & signal.tradable_mask,
+        exits=signal.exits & signal.tradable_mask,
+        init_cash=100_000.0,
+        fees=0.0,
+        slippage=0.0,
+        cash_sharing=True,
+        group_by=True,
+        size=1.0 / 1,
+        size_type="percent",
+        call_seq="auto",
+        freq="1D",
+    )
+    records = portfolio.orders.records_readable
+    assert len(records) >= 2
+    buy = records.iloc[0]
+    assert buy["Price"] == 11.0  # next-day open, not the 12.0 close
+
+
+def test_vectorbt_exit_rolls_forward_past_untradable_day() -> None:
+    """PR 4.1: an exit scheduled on an untradable day rolls to the next
+    tradable day instead of cancelling."""
+    prices = pd.DataFrame(
+        [
+            {"date": "2026-01-02", "symbol": "A", "open": 10.0, "close": 10.0,
+             "volume": 1000},
+            {"date": "2026-01-05", "symbol": "A", "open": 11.0, "close": 11.0,
+             "volume": 1000},
+            # scheduled exit day: suspended (zero volume)
+            {"date": "2026-01-06", "symbol": "A", "open": 12.0, "close": 12.0,
+             "volume": 0, "suspended": True},
+            {"date": "2026-01-07", "symbol": "A", "open": 13.0, "close": 13.0,
+             "volume": 1000},
+        ]
+    )
+    scores = pd.DataFrame(
+        [{"signal_date": "2026-01-02", "symbol": "A", "score": 90.0}]
+    )
+    signal = convert_scores_to_signals(
+        scores,
+        prices,
+        top_n=1,
+        holding_period=2,
+        rebalance_frequency="daily",
+    )
+    # entry on 01-05, exit scheduled 01-06 (untradable) -> rolls to 01-07
+    assert bool(signal.entries.loc[pd.Timestamp("2026-01-05"), "A"])
+    assert not bool(signal.exits.loc[pd.Timestamp("2026-01-06"), "A"])
+    assert bool(signal.exits.loc[pd.Timestamp("2026-01-07"), "A"])
+
+
 def test_vectorbt_parameter_set_changes_scores_and_applies_research_filters() -> None:
     scores = pd.DataFrame(
         [

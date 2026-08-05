@@ -875,6 +875,13 @@ class WalkForwardTaskService:
             else 1.0
         )
         merged_dd = _combined_oos_max_drawdown(evaluated_windows)
+        # PR 4.1: proxy executions must never qualify for promotion.  A
+        # window only counts as strict when the engine explicitly produced
+        # an execution_result_level == "strict" result.
+        strict_execution_available = bool(evaluated_windows) and all(
+            item["test_metrics"].get("execution_result_level") == "strict"
+            for item in evaluated_windows
+        )
         gates = {
             "oos_evaluation_complete": oos_evaluation_complete,
             "positive_tradable_excess_3_of_4": sum(value > 0 for value in excess) >= 3,
@@ -895,7 +902,9 @@ class WalkForwardTaskService:
             ),
             "at_least_3_positive_industries": industry_positive >= 3,
             "single_industry_contribution_within_40pct": max_industry_share <= 0.4,
+            "strict_execution_available": strict_execution_available,
         }
+        promotion_eligible = bool(gates) and all(gates.values())
         return {
             "metrics": {
                 "test_window_count": len(windows),
@@ -907,7 +916,11 @@ class WalkForwardTaskService:
                 "closed_trade_count": closed_trades,
                 "max_drawdown": merged_dd,
             },
-            "gates": {**gates, "all_passed": all(gates.values())},
+            "gates": {
+                **gates,
+                "promotion_eligible": promotion_eligible,
+                "all_passed": promotion_eligible,
+            },
         }
 
     def _write_artifacts(
@@ -1522,6 +1535,14 @@ def _empty_formal_metrics() -> dict[str, Any]:
         "top_trade_contributions": {"positive_pnl": 0.0, "positive_pnl_total": 0.0},
         "positive_trade_pnls": [],
         "pnl_by_industry": {},
+        # PR 4.1: execution provenance on every window.  Proxy results can
+        # never satisfy the promotion gate.
+        "engine_code": "ashare_daily_v2_proxy",
+        "execution_result_level": "proxy",
+        "corporate_action_mode": "total_return_proxy",
+        "execution_confidence": "reduced",
+        "strict_execution_status": "blocked",
+        "production_eligible": False,
     }
 
 
@@ -1611,57 +1632,24 @@ def _rank_ic_positive(signals: pd.DataFrame, market: pd.DataFrame) -> bool:
 
 
 def _trade_concentration(trades: list[dict[str, Any]], market: pd.DataFrame) -> dict[str, Any]:
-    buys: dict[str, list[dict[str, Any]]] = {}
+    """Aggregate realized PnL from v2 execution-engine sell records.
+
+    PR 4.1: the FIFO lot ledger inside the execution engine already computes
+    exact realized_pnl with matched lots; walk-forward must NOT re-derive
+    buy/sell pairings from the raw trade list.  A sell without realized_pnl
+    is a contract violation.
+    """
+    del market  # industry attribution now comes from industry_at_entry
     closed_trade_pnls: list[float] = []
     industry_pnl: dict[str, float] = {}
-    market_frame = market.copy()
-    market_frame["date"] = pd.to_datetime(market_frame["date"], errors="coerce").dt.normalize()
-    market_frame["symbol"] = market_frame["symbol"].astype(str)
-    industry_by_key = (
-        market_frame.drop_duplicates(["date", "symbol"], keep="last")
-        .set_index(["date", "symbol"])
-        .get("industry", pd.Series(dtype=str))
-        .to_dict()
-    )
-    industry_by_symbol = (
-        market_frame.drop_duplicates("symbol", keep="last")
-        .set_index("symbol")
-        .get("industry", pd.Series(dtype=str))
-        .to_dict()
-    )
     for trade in trades:
-        symbol = str(trade.get("symbol", ""))
-        if trade.get("side") == "buy":
-            buys.setdefault(symbol, []).append(trade)
+        if trade.get("side") != "sell":
             continue
-        if trade.get("side") != "sell" or not buys.get(symbol):
-            continue
-        buy = buys[symbol].pop(0)
-        buy_gross = float(buy.get("gross_amount", 0.0))
-        sell_gross = float(trade.get("gross_amount", 0.0))
-        if buy_gross == 0.0:
-            buy_gross = float(buy.get("price", 0.0)) * float(buy.get("quantity", 0.0))
-        if sell_gross == 0.0:
-            sell_gross = float(trade.get("price", 0.0)) * float(trade.get("quantity", 0.0))
-        pnl = (
-            sell_gross
-            - float(trade.get("commission", 0.0))
-            - float(trade.get("stamp_tax", 0.0))
-            - buy_gross
-            - float(buy.get("commission", 0.0))
-            - float(buy.get("stamp_tax", 0.0))
-        )
+        if "realized_pnl" not in trade:
+            raise ValueError("v2 sell trade is missing realized_pnl")
+        pnl = float(trade["realized_pnl"])
+        industry = str(trade.get("industry_at_entry", "unknown"))
         closed_trade_pnls.append(pnl)
-        try:
-            trade_day: pd.Timestamp | None = pd.Timestamp(
-                str(trade.get("trade_date", ""))
-            ).normalize()
-        except (TypeError, ValueError):
-            trade_day = None
-        industry_value = industry_by_symbol.get(symbol, "unknown")
-        if trade_day is not None:
-            industry_value = industry_by_key.get((trade_day, symbol), industry_value)
-        industry = str(industry_value)
         industry_pnl[industry] = industry_pnl.get(industry, 0.0) + pnl
     positive = [value for value in closed_trade_pnls if value > 0]
     positive_total = sum(positive)

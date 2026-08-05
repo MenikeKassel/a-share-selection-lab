@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 # Decimal per-share price tick used for limit-price rounding.
@@ -133,14 +133,13 @@ def limit_prices(
 ) -> tuple[Decimal, Decimal]:
     """Compute (limit_up_price, limit_down_price) with A-share rounding.
 
-    Rounding rule: up price rounds down to tick, down price rounds up to
-    tick, matching exchange practice (ST stock with 0.05 limit still ticks
-    at 0.01).
+    PR 4.1: SSE and SZSE rules require rounding the theoretical limit
+    price to the nearest price tick (half-up), for both directions.
     """
     raw_up = pre_close * (1 + ratio)
     raw_down = pre_close * (1 - ratio)
-    limit_up = (raw_up / tick).to_integral_value(rounding="ROUND_DOWN") * tick
-    limit_down = (raw_down / tick).to_integral_value(rounding="ROUND_UP") * tick
+    limit_up = raw_up.quantize(tick, rounding=ROUND_HALF_UP)
+    limit_down = raw_down.quantize(tick, rounding=ROUND_HALF_UP)
     return limit_up, limit_down
 
 

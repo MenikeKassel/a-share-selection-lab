@@ -325,3 +325,91 @@ def test_ledger_industry_at_entry_preserved() -> None:
     assert sale is not None
     assert sale.industry_at_entry == "bank"
     assert sale.industry_at_exit == "tech"
+
+
+# ---------------------------------------------------------------------------
+# PR 4.1: proxy commission accounting
+
+
+def test_proxy_round_trip_flat_price_loses_only_fees() -> None:
+    """Buy then sell at unchanged adjusted prices: loss == buy+sell fees."""
+    market = _market(
+        [
+            {"date": "2024-01-02", "symbol": "A", "open": 10.0, "high": 10.0,
+             "low": 10.0, "close": 10.0, "pre_close": 10.0, "volume": 1_000_000,
+             "adj_open": 10.0, "adj_close": 10.0, "suspended": False,
+             "industry": "tech", "open_at_limit_up": False, "open_at_limit_down": False},
+            {"date": "2024-01-03", "symbol": "A", "open": 10.0, "high": 10.0,
+             "low": 10.0, "close": 10.0, "pre_close": 10.0, "volume": 1_000_000,
+             "adj_open": 10.0, "adj_close": 10.0, "suspended": False,
+             "industry": "tech", "open_at_limit_up": False, "open_at_limit_down": False},
+            {"date": "2024-01-04", "symbol": "A", "open": 10.0, "high": 10.0,
+             "low": 10.0, "close": 10.0, "pre_close": 10.0, "volume": 1_000_000,
+             "adj_open": 10.0, "adj_close": 10.0, "suspended": False,
+             "industry": "tech", "open_at_limit_up": False, "open_at_limit_down": False},
+        ]
+    )
+    signals = _signals(
+        [{"signal_date": "2024-01-02", "symbol": "A", "score": 1.0}]
+    )
+    request = _request(
+        holding_period=1,
+        commission_rate=0.0003,
+        minimum_commission=0.0,
+        stamp_tax_rate=0.0005,
+        slippage_bps=0.0,
+        initial_cash=100_000.0,
+    )
+    result = AshareDailyV2ProxyEngine().run_with_data(request, market, signals)
+    assert result.performance["trade_count"] == 2  # one buy + one sell
+    sell = next(trade for trade in result.trades if trade["side"] == "sell")
+    buy = next(trade for trade in result.trades if trade["side"] == "buy")
+    expected_loss = float(buy["commission"]) + float(sell["commission"]) + float(
+        sell["stamp_tax"]
+    )
+    assert result.performance["tradable_return"] == pytest.approx(
+        -expected_loss / request.initial_cash, abs=1e-9
+    )
+    # realized_pnl equals -fees exactly (flat price, price-only notional)
+    assert sell["realized_pnl"] == pytest.approx(-expected_loss, abs=1e-9)
+
+
+def test_proxy_round_trip_preserves_price_gain_without_buy_commission_inflation() -> None:
+    """Price-only notional: value tracks price move, buy commission not counted twice."""
+    market = _market(
+        [
+            {"date": "2024-01-02", "symbol": "A", "open": 10.0, "high": 10.0,
+             "low": 10.0, "close": 10.0, "pre_close": 10.0, "volume": 1_000_000,
+             "adj_open": 10.0, "adj_close": 10.0, "suspended": False,
+             "industry": "tech", "open_at_limit_up": False, "open_at_limit_down": False},
+            {"date": "2024-01-03", "symbol": "A", "open": 11.0, "high": 11.0,
+             "low": 11.0, "close": 11.0, "pre_close": 10.0, "volume": 1_000_000,
+             "adj_open": 11.0, "adj_close": 11.0, "suspended": False,
+             "industry": "tech", "open_at_limit_up": False, "open_at_limit_down": False},
+            {"date": "2024-01-04", "symbol": "A", "open": 12.0, "high": 12.0,
+             "low": 12.0, "close": 12.0, "pre_close": 11.0, "volume": 1_000_000,
+             "adj_open": 12.0, "adj_close": 12.0, "suspended": False,
+             "industry": "tech", "open_at_limit_up": False, "open_at_limit_down": False},
+        ]
+    )
+    signals = _signals(
+        [{"signal_date": "2024-01-02", "symbol": "A", "score": 1.0}]
+    )
+    request = _request(
+        holding_period=1,
+        commission_rate=0.0003,
+        minimum_commission=0.0,
+        stamp_tax_rate=0.0005,
+        slippage_bps=0.0,
+        initial_cash=100_000.0,
+    )
+    result = AshareDailyV2ProxyEngine().run_with_data(request, market, signals)
+    sell = next(trade for trade in result.trades if trade["side"] == "sell")
+    # max_stock_weight 0.1 -> target 10,000 -> buy 900 shares @ 11
+    # (gross 9,900, buy commission 2.97), sell at adj_open 12
+    # (proxy exit 9,900 * 12/11 = 10,800), sell commission 3.24,
+    # stamp tax 5.40 -> realized = 10800 - 9902.97 - 3.24 - 5.40
+    assert sell["realized_pnl"] == pytest.approx(
+        10_800.0 - 9_902.97 - 3.24 - 5.40, abs=1e-4
+    )
+    assert sell["realized_pnl"] > 800.0  # gain, not fees-only

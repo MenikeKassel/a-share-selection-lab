@@ -89,45 +89,84 @@ def test_walk_forward_does_not_hide_vectorbt_runtime_failures(monkeypatch) -> No
         walk_forward_service._scan_parameters(prices, signals, {}, 1_000_000.0)
 
 
-def test_trade_concentration_uses_closed_trades_and_point_in_time_industry() -> None:
-    market = pd.DataFrame(
-        [
-            {"date": f"2025-01-{day:02d}", "symbol": "A", "industry": "tech"}
-            for day in range(2, 9)
-        ]
-        + [{"date": "2025-01-02", "symbol": "B", "industry": "bank"}]
-    )
+def test_trade_concentration_uses_realized_pnl_from_v2_sell_records() -> None:
+    # PR 4.1: concentration must consume the FIFO ledger's realized_pnl and
+    # industry_at_entry from v2 sell records; no manual buy/sell pairing.
     trades: list[dict[str, object]] = []
     for day, pnl in zip(range(2, 8), [1, 2, 3, 4, 5, 6], strict=True):
-        trades.extend(
-            [
-                {
-                    "trade_date": f"2025-01-{day:02d}",
-                    "symbol": "A",
-                    "side": "buy",
-                    "quantity": 100,
-                    "price": 1.0,
-                    "gross_amount": 100.0,
-                    "commission": 0.0,
-                    "stamp_tax": 0.0,
-                },
-                {
-                    "trade_date": f"2025-01-{day:02d}",
-                    "symbol": "A",
-                    "side": "sell",
-                    "quantity": 100,
-                    "price": 1.0 + pnl / 100,
-                    "gross_amount": 100.0 + pnl,
-                    "commission": 0.0,
-                    "stamp_tax": 0.0,
-                },
-            ]
+        trades.append(
+            {
+                "trade_date": f"2025-01-{day:02d}",
+                "symbol": "A",
+                "side": "sell",
+                "quantity": 100,
+                "price": 1.0 + pnl / 100,
+                "gross_amount": 100.0 + pnl,
+                "commission": 0.0,
+                "stamp_tax": 0.0,
+                "realized_pnl": pnl,
+                "matched_cost": 100.0,
+                "matched_lot_ids": [f"L{day:06d}"],
+                "industry_at_entry": "tech",
+            }
         )
-    result = walk_forward_service._trade_concentration(trades, market)
+    result = walk_forward_service._trade_concentration(trades, pd.DataFrame())
 
     assert result["positive_trade_pnls"] == [1, 2, 3, 4, 5, 6]
     assert result["top_trade_contributions"]["positive_pnl"] == 20
     assert result["top_trade_contributions"]["positive_pnl_total"] == 21
+    assert result["positive_industry_count"] == 1
+    assert result["pnl_by_industry"] == {"tech": 21}
+
+
+def test_trade_concentration_rejects_sell_without_realized_pnl() -> None:
+    trades = [
+        {
+            "trade_date": "2025-01-02",
+            "symbol": "A",
+            "side": "sell",
+            "quantity": 100,
+            "price": 1.0,
+            "gross_amount": 100.0,
+            "commission": 0.0,
+            "stamp_tax": 0.0,
+        }
+    ]
+    with pytest.raises(ValueError, match="v2 sell trade is missing realized_pnl"):
+        walk_forward_service._trade_concentration(trades, pd.DataFrame())
+
+
+def test_trade_concentration_uses_industry_at_entry() -> None:
+    trades = [
+        {
+            "trade_date": "2025-01-02",
+            "symbol": "A",
+            "side": "sell",
+            "quantity": 100,
+            "price": 1.0,
+            "gross_amount": 100.0,
+            "commission": 0.0,
+            "stamp_tax": 0.0,
+            "realized_pnl": 5.0,
+            "matched_cost": 100.0,
+            "industry_at_entry": "bank",
+        },
+        {
+            "trade_date": "2025-01-03",
+            "symbol": "B",
+            "side": "sell",
+            "quantity": 100,
+            "price": 1.0,
+            "gross_amount": 100.0,
+            "commission": 0.0,
+            "stamp_tax": 0.0,
+            "realized_pnl": -3.0,
+            "matched_cost": 100.0,
+            "industry_at_entry": "tech",
+        },
+    ]
+    result = walk_forward_service._trade_concentration(trades, pd.DataFrame())
+    assert result["pnl_by_industry"] == {"bank": 5.0, "tech": -3.0}
     assert result["positive_industry_count"] == 1
 
 
@@ -429,6 +468,84 @@ def test_aggregate_windows_requires_evaluated_oos_windows() -> None:
     assert aggregate["gates"]["oos_evaluation_complete"] is False
     assert aggregate["gates"]["combined_oos_max_drawdown_within_limit"] is False
     assert aggregate["gates"]["all_passed"] is False
+
+
+def test_aggregate_windows_proxy_never_promotion_eligible() -> None:
+    """PR 4.1: proxy execution results can never pass the promotion gate."""
+
+    def metrics(strategy_return: float, pnl: float) -> dict[str, object]:
+        return {
+            "tradable_return": strategy_return,
+            "tradable_excess_return": strategy_return,
+            "benchmark_return": 0.0,
+            "composite_rank_ic_positive": True,
+            "closed_trade_count": 100,
+            "equity_curve": [
+                {"date": "2025-01-01", "equity": 100.0},
+                {"date": "2025-01-02", "equity": 110.0},
+            ],
+            "initial_cash": 100.0,
+            "positive_trade_pnls": [pnl],
+            "pnl_by_industry": {"tech": pnl},
+            "execution_result_level": "proxy",
+            "strict_execution_status": "blocked",
+            "production_eligible": False,
+        }
+
+    windows = [
+        {
+            "evaluation_status": "evaluated",
+            "test_metrics": metrics(0.10, 10.0),
+            "stress_10bps": metrics(0.10, 10.0),
+            "nearby_parameters": [{"test": {"tradable_excess_return": 0.1}}],
+        }
+        for _ in range(4)
+    ]
+    aggregate = WalkForwardTaskService._aggregate_windows(windows, 0.20)
+
+    assert aggregate["gates"]["strict_execution_available"] is False
+    assert aggregate["gates"]["promotion_eligible"] is False
+    assert aggregate["gates"]["all_passed"] is False
+
+
+def test_aggregate_windows_strict_can_pass_when_all_gates_pass() -> None:
+    """PR 4.1: strict windows may satisfy the promotion gate."""
+
+    def metrics(strategy_return: float, pnl: float) -> dict[str, object]:
+        return {
+            "tradable_return": strategy_return,
+            "tradable_excess_return": strategy_return,
+            "benchmark_return": 0.0,
+            "composite_rank_ic_positive": True,
+            "closed_trade_count": 100,
+            "equity_curve": [
+                {"date": "2025-01-01", "equity": 100.0},
+                {"date": "2025-01-02", "equity": 110.0},
+            ],
+            "initial_cash": 100.0,
+            # 5 small positive trades per window: top-5 contribution across
+            # 4 windows is 5/20 = 25% <= 35%.
+            "positive_trade_pnls": [pnl / 5] * 5,
+            "pnl_by_industry": {f"ind{i}": pnl / 4 for i in range(4)},
+            "execution_result_level": "strict",
+            "strict_execution_status": "available",
+            "production_eligible": True,
+        }
+
+    windows = [
+        {
+            "evaluation_status": "evaluated",
+            "test_metrics": metrics(0.10, 10.0),
+            "stress_10bps": metrics(0.10, 10.0),
+            "nearby_parameters": [{"test": {"tradable_excess_return": 0.1}}],
+        }
+        for _ in range(4)
+    ]
+    aggregate = WalkForwardTaskService._aggregate_windows(windows, 0.20)
+
+    assert aggregate["gates"]["strict_execution_available"] is True
+    assert aggregate["gates"]["promotion_eligible"] is True
+    assert aggregate["gates"]["all_passed"] is True
 
 
 def test_walk_forward_report_renders_not_evaluated_windows_as_na(tmp_path) -> None:
