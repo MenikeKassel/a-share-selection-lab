@@ -12,7 +12,7 @@ from app.research.walk_forward import (
     generate_annual_walk_forward_splits,
 )
 from app.services import walk_forward as walk_forward_service
-from app.services.walk_forward import WalkForwardTaskService
+from app.services.walk_forward import WalkForwardSnapshotError, WalkForwardTaskService
 
 
 def test_walk_forward_ranges_must_be_ordered() -> None:
@@ -325,3 +325,328 @@ def test_execution_price_view_drops_research_only_wide_columns() -> None:
     )
     assert "name" not in prices
     assert "adj_close" not in prices
+
+
+def test_research_scan_and_formal_run_receive_different_price_views(monkeypatch) -> None:
+    payload = WalkForwardRunRequest(experiment_code="price-view-routing-test")
+    split = WalkForwardSplit(
+        train_start=date(2018, 1, 1),
+        train_end=date(2018, 12, 31),
+        validation_start=date(2019, 1, 1),
+        validation_end=date(2019, 12, 31),
+        test_start=date(2020, 1, 1),
+        test_end=date(2020, 12, 31),
+    )
+    research_prices = pd.DataFrame(
+        [
+            {"date": "2018-01-02", "symbol": "A", "close": 10.0},
+            {"date": "2019-01-02", "symbol": "A", "close": 11.0},
+            {"date": "2020-01-02", "symbol": "A", "close": 12.0},
+        ]
+    )
+    execution_prices = pd.DataFrame(
+        [
+            {"date": "2018-01-02", "symbol": "A", "open": 20.0, "close": 20.0, "volume": 1000},
+            {"date": "2019-01-02", "symbol": "A", "open": 21.0, "close": 21.0, "volume": 1000},
+            {"date": "2020-01-02", "symbol": "A", "open": 22.0, "close": 22.0, "volume": 1000},
+        ]
+    )
+    signals = pd.DataFrame(
+        [
+            {"signal_date": "2018-01-02", "symbol": "A", "score": 1.0},
+            {"signal_date": "2019-01-02", "symbol": "A", "score": 1.0},
+            {"signal_date": "2020-01-02", "symbol": "A", "score": 1.0},
+        ]
+    )
+    scan_closes: list[float] = []
+    formal_closes: list[float] = []
+    scan_result = [
+        {
+            "parameter_set": {
+                "top_n": 1,
+                "holding_period": 5,
+                "rebalance_frequency": "daily",
+                "commission_rate": 0.0003,
+                "slippage_bps": 5.0,
+            },
+            "cumulative_return": 0.10,
+            "annualized_return": 0.10,
+            "max_drawdown": 0.05,
+            "sharpe": 1.0,
+            "turnover": 0.1,
+            "trade_count": 2,
+            "win_rate": 0.5,
+            "metadata": {},
+        }
+    ]
+
+    def fake_scan(prices, *_args, **_kwargs):
+        scan_closes.append(float(prices["close"].iloc[0]))
+        return scan_result
+
+    def fake_formal(_payload, prices, *_args, **_kwargs):
+        formal_closes.append(float(prices["close"].iloc[0]))
+        return {
+            **walk_forward_service._empty_formal_metrics(),
+            "initial_cash": 1_000_000.0,
+            "equity_curve": [{"date": "2020-01-02", "equity": 1_000_000.0}],
+        }
+
+    monkeypatch.setattr(walk_forward_service, "_scan_parameters", fake_scan)
+    monkeypatch.setattr(walk_forward_service, "_formal_run", fake_formal)
+
+    result = WalkForwardTaskService._run_split(
+        payload,
+        split,
+        research_prices,
+        execution_prices,
+        signals,
+        benchmark=None,
+    )
+
+    assert scan_closes == [10.0, 11.0]
+    assert formal_closes and all(value == 22.0 for value in formal_closes)
+    assert result["evaluation_status"] == "evaluated"
+
+
+def test_aggregate_windows_requires_evaluated_oos_windows() -> None:
+    windows = [
+        {
+            "evaluation_status": "not_evaluated",
+            "failure_stage": "training_filter",
+            "failure_reason": "no training parameter passed cost and drawdown filters",
+            "test_metrics": walk_forward_service._empty_formal_metrics(),
+            "stress_10bps": walk_forward_service._empty_formal_metrics(),
+            "nearby_parameters": [],
+        }
+        for _ in range(4)
+    ]
+
+    aggregate = WalkForwardTaskService._aggregate_windows(windows, 0.20)
+
+    assert aggregate["metrics"]["oos_evaluated_window_count"] == 0
+    assert aggregate["metrics"]["oos_evaluation_complete"] is False
+    assert aggregate["gates"]["oos_evaluation_complete"] is False
+    assert aggregate["gates"]["combined_oos_max_drawdown_within_limit"] is False
+    assert aggregate["gates"]["all_passed"] is False
+
+
+def test_walk_forward_report_renders_not_evaluated_windows_as_na(tmp_path) -> None:
+    service = object.__new__(WalkForwardTaskService)
+    service.settings = SimpleNamespace(artifact_root=tmp_path)
+    windows = [
+        {
+            "train_start": "2018-01-01",
+            "train_end": "2020-12-31",
+            "validation_start": "2021-01-01",
+            "validation_end": "2021-12-31",
+            "test_start": "2022-01-01",
+            "test_end": "2022-12-31",
+            "selected_parameters": {},
+            "evaluation_status": "not_evaluated",
+            "failure_stage": "training_filter",
+            "failure_reason": "no training parameter passed cost and drawdown filters",
+            "test_metrics": walk_forward_service._empty_formal_metrics(),
+        }
+    ]
+
+    report = service._write_artifacts(
+        "not-evaluated-report-test",
+        {
+            "strategy_code": "trend_quality_v1",
+            "lifecycle_status": "experimental",
+            "gates": {"all_passed": False},
+            "splits": windows,
+        },
+        signals=None,
+    )
+
+    text = report.read_text(encoding="utf-8")
+    assert "not evaluated because no training parameter passed" in text
+    assert "N/A | N/A | N/A | 0" in text
+    assert "0.0000%" not in text
+
+
+def test_scan_summary_counts_best_and_median_metrics() -> None:
+    scan = [
+        {
+            "parameter_set": {"top_n": 5},
+            "cumulative_return": -0.10,
+            "max_drawdown": 0.10,
+            "sharpe": -0.5,
+        },
+        {
+            "parameter_set": {"top_n": 10},
+            "cumulative_return": 0.20,
+            "max_drawdown": 0.25,
+            "sharpe": 1.4,
+        },
+        {
+            "parameter_set": {"top_n": 20},
+            "cumulative_return": 0.05,
+            "max_drawdown": 0.05,
+            "sharpe": 0.7,
+        },
+    ]
+
+    summary = walk_forward_service._scan_summary(scan, 0.20)
+
+    assert summary["parameter_count"] == 3
+    assert summary["positive_return_count"] == 2
+    assert summary["drawdown_pass_count"] == 2
+    assert summary["both_pass_count"] == 1
+    assert summary["best_cumulative_return"] == pytest.approx(0.20)
+    assert summary["best_cumulative_return_parameters"] == {"top_n": 10}
+    assert summary["lowest_max_drawdown"] == pytest.approx(0.05)
+    assert summary["lowest_max_drawdown_parameters"] == {"top_n": 20}
+    assert summary["best_sharpe"] == pytest.approx(1.4)
+    assert summary["best_sharpe_parameters"] == {"top_n": 10}
+    assert summary["median_cumulative_return"] == pytest.approx(0.05)
+    assert summary["median_max_drawdown"] == pytest.approx(0.10)
+
+
+def test_research_prices_strictly_require_adjusted_ohlc() -> None:
+    daily = pd.DataFrame(
+        [
+            {
+                "date": "2025-01-02",
+                "symbol": "A",
+                "adj_open": 10.0,
+                "adj_high": 10.5,
+                "adj_low": 9.8,
+            }
+        ]
+    )
+
+    with pytest.raises(
+        WalkForwardSnapshotError,
+        match="strict walk-forward requires causal adjusted research prices",
+    ):
+        WalkForwardTaskService._prepare_research_prices(daily)
+
+
+def test_historical_signal_replay_reports_progress_per_chunk() -> None:
+    dates = pd.bdate_range("2016-01-01", "2021-12-31")
+    daily = pd.DataFrame({"date": dates, "symbol": "A"})
+
+    class FakeGenerator:
+        strategy_code = "trend_quality_v1"
+        strategy_version = "test"
+        factor_version = "test"
+        information_cutoff = time(18, 30)
+
+        def generate(self, *, start_date, end_date, **_kwargs):
+            signal = pd.DataFrame(
+                [{"signal_date": pd.Timestamp(start_date), "symbol": "A", "score": 1.0}]
+            )
+            return SimpleNamespace(signals=signal, rejected=pd.DataFrame())
+
+    events: list[tuple[str, int, int, str]] = []
+
+    def progress(stage: str, done: int, total: int, detail: str) -> None:
+        events.append((stage, done, total, detail))
+
+    WalkForwardTaskService._generate_historical_signals(
+        FakeGenerator(),
+        daily=daily,
+        financials=None,
+        valuations=None,
+        benchmark=None,
+        industry=None,
+        state_history=pd.DataFrame(),
+        start_date=date(2018, 1, 1),
+        end_date=date(2021, 12, 31),
+        data_snapshot_version="test-snapshot",
+        progress=progress,
+    )
+
+    assert [item[0] for item in events] == ["signals"] * 4
+    assert [(item[1], item[2]) for item in events] == [(1, 4), (2, 4), (3, 4), (4, 4)]
+
+
+def test_run_split_reports_training_and_validation_scan_progress(monkeypatch) -> None:
+    payload = WalkForwardRunRequest(experiment_code="progress-routing-test")
+    split = WalkForwardSplit(
+        train_start=date(2018, 1, 1),
+        train_end=date(2018, 12, 31),
+        validation_start=date(2019, 1, 1),
+        validation_end=date(2019, 12, 31),
+        test_start=date(2020, 1, 1),
+        test_end=date(2020, 12, 31),
+    )
+    research_prices = pd.DataFrame(
+        [
+            {"date": "2018-01-02", "symbol": "A", "close": 10.0},
+            {"date": "2019-01-02", "symbol": "A", "close": 11.0},
+            {"date": "2020-01-02", "symbol": "A", "close": 12.0},
+        ]
+    )
+    execution_prices = pd.DataFrame(
+        [
+            {"date": "2018-01-02", "symbol": "A", "open": 20.0, "close": 20.0, "volume": 1000},
+            {"date": "2019-01-02", "symbol": "A", "open": 21.0, "close": 21.0, "volume": 1000},
+            {"date": "2020-01-02", "symbol": "A", "open": 22.0, "close": 22.0, "volume": 1000},
+        ]
+    )
+    signals = pd.DataFrame(
+        [
+            {"signal_date": "2018-01-02", "symbol": "A", "score": 1.0},
+            {"signal_date": "2019-01-02", "symbol": "A", "score": 1.0},
+            {"signal_date": "2020-01-02", "symbol": "A", "score": 1.0},
+        ]
+    )
+    scan_result = [
+        {
+            "parameter_set": {
+                "top_n": 1,
+                "holding_period": 5,
+                "rebalance_frequency": "daily",
+                "commission_rate": 0.0003,
+                "slippage_bps": 5.0,
+            },
+            "cumulative_return": 0.10,
+            "annualized_return": 0.10,
+            "max_drawdown": 0.05,
+            "sharpe": 1.0,
+            "turnover": 0.1,
+            "trade_count": 2,
+            "win_rate": 0.5,
+            "metadata": {},
+        }
+    ]
+
+    def fake_scan(prices, *_args, progress=None, **_kwargs):
+        if progress is not None:
+            progress(1, 2, "first")
+            progress(2, 2, "second")
+        return scan_result
+
+    def fake_formal(_payload, prices, *_args, **_kwargs):
+        return {
+            **walk_forward_service._empty_formal_metrics(),
+            "initial_cash": 1_000_000.0,
+            "equity_curve": [{"date": "2020-01-02", "equity": 1_000_000.0}],
+        }
+
+    monkeypatch.setattr(walk_forward_service, "_scan_parameters", fake_scan)
+    monkeypatch.setattr(walk_forward_service, "_formal_run", fake_formal)
+
+    events: list[tuple[str, int, int, str]] = []
+
+    def progress(stage: str, done: int, total: int, detail: str) -> None:
+        events.append((stage, done, total, detail))
+
+    WalkForwardTaskService._run_split(
+        payload,
+        split,
+        research_prices,
+        execution_prices,
+        signals,
+        benchmark=None,
+        progress=progress,
+    )
+
+    stages = [item[0] for item in events]
+    assert stages == ["training-scan"] * 2 + ["validation-scan"] * 2
+    assert (events[0][1], events[0][2]) == (1, 2)
+    assert (events[3][1], events[3][2]) == (2, 2)

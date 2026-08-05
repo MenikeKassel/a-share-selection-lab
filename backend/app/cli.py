@@ -3,13 +3,49 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
+from collections.abc import Callable
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 
 from app.core.config import get_settings
 from app.engines.registry import EngineRegistry
+
+
+def _progress_printer() -> Callable[[str, int, int, str], None]:
+    """Render walk-forward progress on stderr without polluting stdout JSON.
+
+    Interactive terminals get an in-place ``\\r`` bar; redirected output
+    (e.g. ``> log 2> err``) gets one compact line per update so logs stay
+    readable.
+    """
+
+    interactive = sys.stderr.isatty()
+    rendered: dict[str, Any] = {"stage": None}
+
+    def render(stage: str, done: int, total: int, detail: str) -> None:
+        if stage != rendered["stage"]:
+            if interactive and rendered["stage"] is not None:
+                sys.stderr.write("\n")
+            rendered["stage"] = stage
+            rendered["done"] = 0
+        percent = done / total if total > 0 else 1.0
+        label = f"[{stage}] {done}/{total} ({percent:5.1%}) {detail}"
+        if interactive:
+            bar_width = 24
+            bar = "█" * round(percent * bar_width) + "░" * (
+                bar_width - round(percent * bar_width)
+            )
+            sys.stderr.write(f"\r\033[K{label} {bar}")
+        else:
+            sys.stderr.write(f"{label}\n")
+        sys.stderr.flush()
+        rendered["done"] = done
+
+    return render
 
 
 def main() -> None:
@@ -185,7 +221,8 @@ def main() -> None:
                 WalkForwardRunRequest(
                     experiment_code=args.experiment_code,
                     snapshot_manifest_path=str(args.manifest),
-                )
+                ),
+                progress=_progress_printer(),
             )
         print(json.dumps(walk_forward_dict(record), ensure_ascii=False, indent=2, default=str))
         return

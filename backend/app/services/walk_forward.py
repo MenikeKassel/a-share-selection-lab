@@ -13,6 +13,7 @@ import gc
 import hashlib
 import json
 import math
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
@@ -42,9 +43,15 @@ from app.research.walk_forward import (
     generate_annual_walk_forward_splits,
 )
 
+#: (stage, done, total, detail); ``done``/``total`` are 1-based human counts.
+ProgressCallback = Callable[[str, int, int, str], None]
+
 
 class WalkForwardSnapshotError(ValueError):
     """The imported snapshot is missing or failed an audit gate."""
+
+
+STRICT_RESEARCH_PRICE_ERROR = "strict walk-forward requires causal adjusted research prices"
 
 
 class WalkForwardTaskService:
@@ -53,7 +60,11 @@ class WalkForwardTaskService:
         self.settings = settings
         self.repository = WalkForwardRepository(session)
 
-    def run(self, payload: WalkForwardRunRequest) -> Any:
+    def run(
+        self,
+        payload: WalkForwardRunRequest,
+        progress: ProgressCallback | None = None,
+    ) -> Any:
         existing = self.repository.get_by_code(payload.experiment_code)
         if existing is not None:
             # Experiment codes are immutable run identities; a retry must read
@@ -84,7 +95,7 @@ class WalkForwardTaskService:
                 error_message=report["error"],
             )
         try:
-            result = self._run_from_manifest(payload, manifest_path)
+            result = self._run_from_manifest(payload, manifest_path, progress=progress)
             rejected = result.pop("_rejected", None)
             artifact = self._write_artifacts(
                 payload.experiment_code,
@@ -130,6 +141,7 @@ class WalkForwardTaskService:
         self,
         payload: WalkForwardRunRequest,
         manifest_path: Path,
+        progress: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         snapshot = validate_snapshot_manifest(
@@ -203,6 +215,7 @@ class WalkForwardTaskService:
             data_snapshot_version=str(
                 manifest.get("snapshot_id", manifest.get("version", "unknown"))
             ),
+            progress=progress,
         )
         if signals.empty:
             raise WalkForwardSnapshotError(
@@ -211,8 +224,10 @@ class WalkForwardTaskService:
         suspensions = self._read_manifest_frame(
             manifest, manifest_path, "suspensions", required=False
         )
+        research_daily = _date_filter(daily, "date", payload.start_date, payload.end_date)
+        research_prices = self._prepare_research_prices(research_daily)
         execution_daily = _date_filter(daily, "date", payload.start_date, payload.end_date)
-        prices = self._prepare_execution_prices(
+        execution_prices = self._prepare_execution_prices(
             execution_daily,
             state_history=state_history,
             suspensions=suspensions,
@@ -225,10 +240,32 @@ class WalkForwardTaskService:
             test_years=1,
         )
         windows: list[dict[str, Any]] = []
-        for split in splits:
-            windows.append(self._run_split(payload, split, prices, signals, benchmark))
+        for split_index, split in enumerate(splits, start=1):
+            if progress is not None:
+                progress(
+                    "split",
+                    split_index,
+                    len(splits),
+                    f"train {split.train_start:%Y}-{split.train_end:%Y}",
+                )
+            windows.append(
+                self._run_split(
+                    payload,
+                    split,
+                    research_prices,
+                    execution_prices,
+                    signals,
+                    benchmark,
+                    progress=progress,
+                )
+            )
         aggregate = self._aggregate_windows(windows, payload.max_drawdown_limit)
-        factor_results = self._factor_results(signals, prices, splits, payload.factor_horizons)
+        factor_results = self._factor_results(
+            signals,
+            research_prices,
+            splits,
+            payload.factor_horizons,
+        )
         return {
             "experiment_code": payload.experiment_code,
             "strategy_code": payload.strategy_code,
@@ -269,6 +306,7 @@ class WalkForwardTaskService:
         end_date: date,
         data_snapshot_version: str,
         warmup_trading_days: int = 400,
+        progress: ProgressCallback | None = None,
     ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
         """Replay one calendar year at a time with an explicit warm-up window."""
 
@@ -277,7 +315,15 @@ class WalkForwardTaskService:
         signal_parts: list[pd.DataFrame] = []
         rejected_parts: list[pd.DataFrame] = []
         chunk_audits: list[dict[str, Any]] = []
-        for year in range(start_date.year, end_date.year + 1):
+        years = range(start_date.year, end_date.year + 1)
+        for chunk_index, year in enumerate(years, start=1):
+            if progress is not None:
+                progress(
+                    "signals",
+                    chunk_index,
+                    len(years),
+                    f"historical signal chunk {year}",
+                )
             output_start = max(start_date, date(year, 1, 1))
             output_end = min(end_date, date(year, 12, 31))
             if output_start > output_end:
@@ -393,13 +439,76 @@ class WalkForwardTaskService:
         return signals, rejected, audit
 
     @staticmethod
+    def _prepare_research_prices(daily: pd.DataFrame) -> pd.DataFrame:
+        """Build the causal-adjusted price view used by research engines."""
+
+        required = {"date", "symbol", "adj_open", "adj_high", "adj_low", "adj_close"}
+        if missing := required.difference(daily.columns):
+            raise WalkForwardSnapshotError(
+                f"{STRICT_RESEARCH_PRICE_ERROR}: missing columns {sorted(missing)}"
+            )
+        column_map = {
+            "adj_open": "open",
+            "adj_high": "high",
+            "adj_low": "low",
+            "adj_close": "close",
+        }
+        if "adj_pre_close" in daily:
+            column_map["adj_pre_close"] = "pre_close"
+        optional_columns = [
+            column for column in ("volume", "amount", "industry") if column in daily
+        ]
+        source_columns = ["date", "symbol", *column_map, *optional_columns]
+        prices = daily.loc[:, source_columns].rename(columns=column_map).copy()
+        prices["date"] = pd.to_datetime(
+            prices["date"], format="mixed", errors="raise"
+        ).dt.normalize()
+        prices["symbol"] = prices["symbol"].astype(str)
+        if prices.duplicated(["date", "symbol"]).any():
+            raise WalkForwardSnapshotError(
+                f"{STRICT_RESEARCH_PRICE_ERROR}: duplicate date/symbol rows"
+            )
+        ohlc = ["open", "high", "low", "close"]
+        for column in ohlc:
+            prices[column] = pd.to_numeric(prices[column], errors="coerce")
+        if "pre_close" in prices:
+            prices["pre_close"] = pd.to_numeric(prices["pre_close"], errors="coerce")
+        if prices[ohlc].isna().any().any():
+            raise WalkForwardSnapshotError(
+                f"{STRICT_RESEARCH_PRICE_ERROR}: adjusted OHLC contains non-numeric values"
+            )
+        high_floor = prices[["open", "close", "low"]].max(axis=1)
+        low_ceiling = prices[["open", "close", "high"]].min(axis=1)
+        if (prices["high"] < high_floor).any():
+            raise WalkForwardSnapshotError(
+                f"{STRICT_RESEARCH_PRICE_ERROR}: adjusted high is below OHLC range"
+            )
+        if (prices["low"] > low_ceiling).any():
+            raise WalkForwardSnapshotError(
+                f"{STRICT_RESEARCH_PRICE_ERROR}: adjusted low is above OHLC range"
+            )
+        if (prices["close"] <= 0).any():
+            raise WalkForwardSnapshotError(
+                f"{STRICT_RESEARCH_PRICE_ERROR}: adjusted close must be positive"
+            )
+        prices["price_basis"] = "causal_hfq"
+        result_columns = ["date", "symbol", "open", "high", "low", "close"]
+        if "pre_close" in prices:
+            result_columns.append("pre_close")
+        result_columns.extend(optional_columns)
+        result_columns.append("price_basis")
+        return prices.loc[:, result_columns].sort_values(["date", "symbol"]).reset_index(
+            drop=True
+        )
+
+    @staticmethod
     def _prepare_execution_prices(
         daily: pd.DataFrame,
         *,
         state_history: pd.DataFrame | None,
         suspensions: pd.DataFrame | None,
     ) -> pd.DataFrame:
-        """Build the formal engine's raw-price view without future state leakage."""
+        """Build the raw-price view used only by the formal A-share execution engine."""
 
         execution_columns = [
             column
@@ -407,8 +516,12 @@ class WalkForwardTaskService:
                 "date",
                 "symbol",
                 "open",
+                "high",
+                "low",
                 "close",
+                "pre_close",
                 "volume",
+                "amount",
                 "adj_factor",
                 "cash_dividend_per_share",
                 "industry",
@@ -419,6 +532,7 @@ class WalkForwardTaskService:
                 "limit_down",
                 "one_word_limit_up",
                 "one_word_limit_down",
+                "listing_days",
             )
             if column in daily
         ]
@@ -504,27 +618,49 @@ class WalkForwardTaskService:
     def _run_split(
         payload: WalkForwardRunRequest,
         split: WalkForwardSplit,
-        prices: pd.DataFrame,
+        research_prices: pd.DataFrame,
+        execution_prices: pd.DataFrame,
         signals: pd.DataFrame,
         benchmark: pd.DataFrame | None,
+        progress: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         train_signals = _date_filter(signals, "signal_date", split.train_start, split.train_end)
         validation_signals = _date_filter(
             signals, "signal_date", split.validation_start, split.validation_end
         )
         test_signals = _date_filter(signals, "signal_date", split.test_start, split.test_end)
-        train_prices = _date_filter(prices, "date", split.train_start, split.train_end)
-        validation_prices = _date_filter(
-            prices, "date", split.validation_start, split.validation_end
+        train_research_prices = _date_filter(
+            research_prices, "date", split.train_start, split.train_end
         )
-        test_prices = _date_filter(prices, "date", split.test_start, split.test_end)
+        validation_research_prices = _date_filter(
+            research_prices, "date", split.validation_start, split.validation_end
+        )
+        test_execution_prices = _date_filter(
+            execution_prices, "date", split.test_start, split.test_end
+        )
         test_benchmark = (
             _date_filter(benchmark, "date", split.test_start, split.test_end)
             if benchmark is not None and not benchmark.empty
             else None
         )
         grid = payload.parameter_grid
-        scan = _scan_parameters(train_prices, train_signals, grid, payload.initial_cash)
+        scan = _scan_parameters(
+            train_research_prices,
+            train_signals,
+            grid,
+            payload.initial_cash,
+            progress=(
+                lambda done, total, detail: progress(
+                    "training-scan", done, total, detail
+                )
+                if progress is not None
+                else None
+            ),
+        )
+        scan_summary = _scan_summary(scan, payload.max_drawdown_limit)
+        training_scan_file = (
+            f"training-scan-{split.train_start:%Y}-{split.train_end:%Y}.parquet"
+        )
         eligible = [
             item
             for item in scan
@@ -541,9 +677,14 @@ class WalkForwardTaskService:
                 "test_start": split.test_start.isoformat(),
                 "test_end": split.test_end.isoformat(),
                 "parameter_scan_count": len(scan),
+                "scan_summary": scan_summary,
+                "training_scan_file": training_scan_file,
+                "_training_scan": scan,
                 "selected_parameters": {},
                 "selected_validation": {},
                 "training_filter_count": 0,
+                "evaluation_status": "not_evaluated",
+                "failure_stage": "training_filter",
                 "test_metrics": empty,
                 "stress_10bps": empty,
                 "nearby_parameters": [],
@@ -551,7 +692,17 @@ class WalkForwardTaskService:
             }
         candidates = eligible
         validation_scan = _scan_parameters(
-            validation_prices, validation_signals, grid, payload.initial_cash
+            validation_research_prices,
+            validation_signals,
+            grid,
+            payload.initial_cash,
+            progress=(
+                lambda done, total, detail: progress(
+                    "validation-scan", done, total, detail
+                )
+                if progress is not None
+                else None
+            ),
         )
         by_key = {_parameter_key(item["parameter_set"]): item for item in validation_scan}
         selected = max(
@@ -573,14 +724,14 @@ class WalkForwardTaskService:
         selected_params = selected["parameter_set"]
         formal = _formal_run(
             payload,
-            test_prices,
+            test_execution_prices,
             test_signals,
             selected_params,
             test_benchmark,
         )
         stress = _formal_run(
             payload,
-            test_prices,
+            test_execution_prices,
             test_signals,
             {**selected_params, "slippage_bps": 10.0},
             test_benchmark,
@@ -595,7 +746,7 @@ class WalkForwardTaskService:
                         "parameter_set": item["parameter_set"],
                         "test": _formal_run(
                             payload,
-                            test_prices,
+                            test_execution_prices,
                             test_signals,
                             item["parameter_set"],
                             test_benchmark,
@@ -610,9 +761,13 @@ class WalkForwardTaskService:
             "test_start": split.test_start.isoformat(),
             "test_end": split.test_end.isoformat(),
             "parameter_scan_count": len(scan),
+            "scan_summary": scan_summary,
+            "training_scan_file": training_scan_file,
+            "_training_scan": scan,
             "selected_parameters": selected_params,
             "selected_validation": by_key.get(_parameter_key(selected_params), {}),
             "training_filter_count": len(eligible),
+            "evaluation_status": "evaluated",
             "test_metrics": formal,
             "stress_10bps": stress,
             "nearby_parameters": nearby,
@@ -664,40 +819,51 @@ class WalkForwardTaskService:
 
     @staticmethod
     def _aggregate_windows(windows: list[dict[str, Any]], max_dd_limit: float) -> dict[str, Any]:
+        evaluated_windows = [item for item in windows if _is_evaluated_window(item)]
+        evaluated_count = len(evaluated_windows)
+        oos_evaluation_complete = evaluated_count == 4
         excess = [
-            float(item["test_metrics"].get("tradable_excess_return", 0.0)) for item in windows
+            float(
+                item["test_metrics"].get(
+                    "tradable_excess_return",
+                    item["test_metrics"].get("excess_return", 0.0),
+                )
+            )
+            for item in evaluated_windows
         ]
         rank_positive = [
             bool(item.get("test_metrics", {}).get("composite_rank_ic_positive", False))
-            for item in windows
+            for item in evaluated_windows
         ]
         stress_strategy_returns = [
-            float(item["stress_10bps"].get("tradable_return", 0.0)) for item in windows
+            float(item["stress_10bps"].get("tradable_return", 0.0))
+            for item in evaluated_windows
         ]
         stress_benchmark_returns = [
-            float(item["stress_10bps"].get("benchmark_return", 0.0)) for item in windows
+            float(item["stress_10bps"].get("benchmark_return", 0.0))
+            for item in evaluated_windows
         ]
         stress_excess = _compound_returns(stress_strategy_returns) - _compound_returns(
             stress_benchmark_returns
         )
         closed_trades = sum(
-            int(item["test_metrics"].get("closed_trade_count", 0)) for item in windows
+            int(item["test_metrics"].get("closed_trade_count", 0)) for item in evaluated_windows
         )
         nearby_values = [
             float(neighbor["test"].get("tradable_excess_return", 0.0))
-            for item in windows
+            for item in evaluated_windows
             for neighbor in item.get("nearby_parameters", [])
         ]
         positive_trade_pnls = [
             float(pnl)
-            for item in windows
+            for item in evaluated_windows
             for pnl in item["test_metrics"].get("positive_trade_pnls", [])
             if float(pnl) > 0
         ]
         positive_pnl = sum(positive_trade_pnls)
         top5 = sum(sorted(positive_trade_pnls, reverse=True)[:5])
         industry_pnl: dict[str, float] = {}
-        for item in windows:
+        for item in evaluated_windows:
             for industry, pnl in item["test_metrics"].get("pnl_by_industry", {}).items():
                 industry_pnl[str(industry)] = industry_pnl.get(str(industry), 0.0) + float(pnl)
         positive_industry_pnl = {key: value for key, value in industry_pnl.items() if value > 0}
@@ -708,12 +874,15 @@ class WalkForwardTaskService:
             if positive_industry_total > 0
             else 1.0
         )
-        merged_dd = _combined_oos_max_drawdown(windows)
+        merged_dd = _combined_oos_max_drawdown(evaluated_windows)
         gates = {
+            "oos_evaluation_complete": oos_evaluation_complete,
             "positive_tradable_excess_3_of_4": sum(value > 0 for value in excess) >= 3,
             "median_oos_excess_positive": float(np.median(excess)) > 0 if excess else False,
             "composite_rank_ic_positive_3_of_4": sum(rank_positive) >= 3,
-            "combined_oos_max_drawdown_within_limit": merged_dd <= max_dd_limit,
+            "combined_oos_max_drawdown_within_limit": (
+                evaluated_count > 0 and merged_dd <= max_dd_limit
+            ),
             "stress_10bps_excess_positive": stress_excess > 0,
             "adjacent_parameters_positive_60pct": (
                 sum(value > 0 for value in nearby_values) / len(nearby_values) >= 0.6
@@ -730,6 +899,8 @@ class WalkForwardTaskService:
         return {
             "metrics": {
                 "test_window_count": len(windows),
+                "oos_evaluated_window_count": evaluated_count,
+                "oos_evaluation_complete": oos_evaluation_complete,
                 "tradable_excess_returns": excess,
                 "median_oos_excess_return": float(np.median(excess)) if excess else 0.0,
                 "stress_10bps_excess_return": stress_excess,
@@ -748,6 +919,7 @@ class WalkForwardTaskService:
     ) -> Path:
         root = self.settings.artifact_root / "walk-forward" / experiment_code
         root.mkdir(parents=True, exist_ok=True)
+        self._write_training_scan_artifacts(root, result)
         output = {
             key: value for key, value in result.items() if key not in {"_signals", "_rejected"}
         }
@@ -776,22 +948,37 @@ class WalkForwardTaskService:
         ]
         for split in output.get("splits", []):
             metrics = split.get("test_metrics", {})
+            evaluated = _is_evaluated_window(split)
+            reason = str(split.get("failure_reason", "") or "")
+            if not evaluated:
+                return_text = "N/A"
+                excess_text = "N/A"
+                drawdown_text = "N/A"
+                trades = int(metrics.get("closed_trade_count", 0))
+                if split.get("failure_stage") == "training_filter":
+                    reason = "not evaluated because no training parameter passed"
+            else:
+                return_text = f"{float(metrics.get('tradable_return', 0.0)):.4%}"
+                excess_value = float(
+                    metrics.get("tradable_excess_return", metrics.get("excess_return", 0.0))
+                )
+                excess_text = f"{excess_value:.4%}"
+                drawdown_text = f"{float(metrics.get('max_drawdown', 0.0)):.4%}"
+                trades = int(metrics.get("closed_trade_count", 0))
             lines.append(
                 (
                     "| {train} | {validation} | {test} | `{params}` | {reason} | "
-                    "{return_:.4%} | {excess:.4%} | {drawdown:.4%} | {trades} |"
+                    "{return_} | {excess} | {drawdown} | {trades} |"
                 ).format(
                     train=f"{split.get('train_start')}..{split.get('train_end')}",
                     validation=f"{split.get('validation_start')}..{split.get('validation_end')}",
                     test=f"{split.get('test_start')}..{split.get('test_end')}",
                     params=json.dumps(split.get("selected_parameters", {}), ensure_ascii=False),
-                    reason=str(split.get("failure_reason", "") or ""),
-                    return_=float(metrics.get("tradable_return", 0.0)),
-                    excess=float(
-                        metrics.get("tradable_excess_return", metrics.get("excess_return", 0.0))
-                    ),
-                    drawdown=float(metrics.get("max_drawdown", 0.0)),
-                    trades=int(metrics.get("closed_trade_count", 0)),
+                    reason=reason,
+                    return_=return_text,
+                    excess=excess_text,
+                    drawdown=drawdown_text,
+                    trades=trades,
                 )
             )
         lines.extend(["", "## Gates", ""])
@@ -827,6 +1014,24 @@ class WalkForwardTaskService:
             encoding="utf-8",
         )
         return report
+
+    @staticmethod
+    def _write_training_scan_artifacts(root: Path, result: dict[str, Any]) -> None:
+        for split in result.get("splits", []):
+            if not isinstance(split, dict):
+                continue
+            scan = split.pop("_training_scan", None)
+            if scan is None:
+                continue
+            filename = Path(str(split.get("training_scan_file", ""))).name
+            if not filename:
+                filename = (
+                    f"training-scan-{split.get('train_start')}-{split.get('train_end')}.parquet"
+                )
+            path = root / filename
+            _training_scan_frame(scan).to_parquet(path, index=False)
+            split["training_scan_file"] = path.name
+            split["training_scan_sha256"] = _sha256_file(path)
 
     def _restricted_data_path(self, path_value: str) -> Path | None:
         path = Path(path_value).expanduser()
@@ -1046,6 +1251,163 @@ def _frame_length(frame: pd.DataFrame | None) -> int:
     return 0 if frame is None else len(frame)
 
 
+def _scan_summary(
+    scan: list[dict[str, Any]],
+    max_drawdown_limit: float,
+) -> dict[str, Any]:
+    cumulative_returns = [
+        _scan_metric(item, "cumulative_return", 0.0)
+        for item in scan
+        if _has_finite_scan_metric(item, "cumulative_return")
+    ]
+    max_drawdowns = [
+        _scan_metric(item, "max_drawdown", 0.0)
+        for item in scan
+        if _has_finite_scan_metric(item, "max_drawdown")
+    ]
+    positive_count = sum(_scan_metric(item, "cumulative_return", 0.0) > 0 for item in scan)
+    drawdown_count = sum(
+        _scan_metric(item, "max_drawdown", math.inf) <= max_drawdown_limit for item in scan
+    )
+    both_count = sum(
+        _scan_metric(item, "cumulative_return", 0.0) > 0
+        and _scan_metric(item, "max_drawdown", math.inf) <= max_drawdown_limit
+        for item in scan
+    )
+    best_return = _best_scan_item(scan, "cumulative_return", reverse=True)
+    lowest_drawdown = _best_scan_item(scan, "max_drawdown", reverse=False)
+    best_sharpe = _best_scan_item(scan, "sharpe", reverse=True)
+    return {
+        "parameter_count": len(scan),
+        "positive_return_count": positive_count,
+        "drawdown_pass_count": drawdown_count,
+        "both_pass_count": both_count,
+        "best_cumulative_return": (
+            _scan_metric(best_return, "cumulative_return", 0.0) if best_return else 0.0
+        ),
+        "best_cumulative_return_parameters": (
+            _scan_parameters_from_item(best_return) if best_return else {}
+        ),
+        "lowest_max_drawdown": (
+            _scan_metric(lowest_drawdown, "max_drawdown", 0.0) if lowest_drawdown else 0.0
+        ),
+        "lowest_max_drawdown_parameters": (
+            _scan_parameters_from_item(lowest_drawdown) if lowest_drawdown else {}
+        ),
+        "best_sharpe": _scan_metric(best_sharpe, "sharpe", 0.0) if best_sharpe else 0.0,
+        "best_sharpe_parameters": _scan_parameters_from_item(best_sharpe) if best_sharpe else {},
+        "median_cumulative_return": (
+            float(np.median(cumulative_returns)) if cumulative_returns else 0.0
+        ),
+        "median_max_drawdown": float(np.median(max_drawdowns)) if max_drawdowns else 0.0,
+    }
+
+
+def _best_scan_item(
+    scan: list[dict[str, Any]],
+    metric: str,
+    *,
+    reverse: bool,
+) -> dict[str, Any] | None:
+    candidates = [item for item in scan if _has_finite_scan_metric(item, metric)]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda item: _scan_metric(item, metric, 0.0), reverse=reverse)[0]
+
+
+def _has_finite_scan_metric(item: dict[str, Any], metric: str) -> bool:
+    value: Any = item.get(metric)
+    if value is None:
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def _scan_metric(item: dict[str, Any], metric: str, default: float) -> float:
+    try:
+        value = float(item.get(metric, default))
+    except (TypeError, ValueError):
+        return default
+    return value if math.isfinite(value) else default
+
+
+def _scan_parameters_from_item(item: dict[str, Any] | None) -> dict[str, Any]:
+    if not item:
+        return {}
+    parameters = item.get("parameter_set", {})
+    return dict(parameters) if isinstance(parameters, dict) else {}
+
+
+def _training_scan_frame(scan: list[dict[str, Any]]) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for item in scan:
+        row: dict[str, Any] = {}
+        for key, value in item.items():
+            if key == "parameter_set" and isinstance(value, dict):
+                row["parameter_set_json"] = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+                for parameter_key, parameter_value in value.items():
+                    row[f"parameter_{parameter_key}"] = _parquet_scalar(parameter_value)
+            elif key == "metadata" and isinstance(value, dict):
+                row["metadata_json"] = json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+            else:
+                row[key] = _parquet_scalar(value)
+        rows.append(row)
+    if rows:
+        return pd.DataFrame(rows)
+    return pd.DataFrame(
+        columns=[
+            "parameter_set_json",
+            "cumulative_return",
+            "annualized_return",
+            "max_drawdown",
+            "sharpe",
+            "turnover",
+            "trade_count",
+            "win_rate",
+            "metadata_json",
+        ]
+    )
+
+
+def _parquet_scalar(value: Any) -> Any:
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return value
+
+
+def _is_evaluated_window(item: dict[str, Any]) -> bool:
+    status = item.get("evaluation_status")
+    if status == "evaluated":
+        return True
+    if status == "not_evaluated":
+        return False
+    metrics = item.get("test_metrics")
+    if not isinstance(metrics, dict) or not metrics:
+        return False
+    curve = metrics.get("equity_curve")
+    if isinstance(curve, list) and len(curve) > 0:
+        return True
+    if _scan_metric(metrics, "initial_cash", 0.0) > 0:
+        return True
+    if int(_scan_metric(metrics, "closed_trade_count", 0.0)) > 0:
+        return True
+    return bool(item.get("selected_parameters")) and (
+        "tradable_return" in metrics or "max_drawdown" in metrics
+    )
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -1068,6 +1430,7 @@ def _scan_parameters(
     signals: pd.DataFrame,
     grid: dict[str, list[Any]],
     initial_cash: float,
+    progress: Callable[[int, int, str], None] | None = None,
 ) -> list[dict[str, Any]]:
     if prices.empty or signals.empty:
         return []
@@ -1078,6 +1441,7 @@ def _scan_parameters(
             signals,
             grid,
             initial_cash=initial_cash,
+            progress=progress,
         )
     ]
 

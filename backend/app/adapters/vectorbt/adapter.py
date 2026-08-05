@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import asdict
 from importlib.util import find_spec
 from itertools import product
@@ -32,16 +33,25 @@ class VectorBTResearchAdapter:
         parameter_grid: dict[str, list[Any]],
         *,
         initial_cash: float = 1_000_000.0,
+        progress: Callable[[int, int, str], None] | None = None,
     ) -> list[VectorBTResearchResult]:
         if not self.is_available():
             raise OptionalEngineUnavailableError(
                 "VectorBT 未安装；运行 uv sync --extra fast-backtest。"
             )
         parameters = self._expand_grid(parameter_grid)
-        return [
-            self.run(prices, scores, parameter, initial_cash=initial_cash)
-            for parameter in parameters
-        ]
+        results: list[VectorBTResearchResult] = []
+        for index, parameter in enumerate(parameters, start=1):
+            if progress is not None:
+                progress(
+                    index,
+                    len(parameters),
+                    f"top_n={parameter.top_n} hold={parameter.holding_period} "
+                    f"rebalance={parameter.rebalance_frequency} "
+                    f"slippage={parameter.slippage_bps:g}bps",
+                )
+            results.append(self.run(prices, scores, parameter, initial_cash=initial_cash))
+        return results
 
     def run(
         self,

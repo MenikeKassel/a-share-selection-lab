@@ -37,6 +37,9 @@ conditions: positive return after costs and maximum drawdown no greater than
 and the promotion gates did not pass. This is a valid research conclusion,
 not a technical success claim for the strategy.
 
+This experiment was superseded for strategy interpretation because research
+return evaluation used the raw execution price view.
+
 The compact immutable artifacts committed with this record are:
 
 - [`REPORT.md`](../../data/artifacts/walk-forward/trend-quality-wf-2018-2025-purchased-v6/REPORT.md)

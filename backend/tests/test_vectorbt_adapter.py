@@ -1,7 +1,9 @@
 import pandas as pd
+import pytest
 from app.adapters.vectorbt.adapter import VectorBTResearchAdapter
 from app.adapters.vectorbt.schemas import VectorBTParameterSet
 from app.adapters.vectorbt.signal_converter import convert_scores_to_signals
+from app.services.walk_forward import WalkForwardTaskService
 
 
 def test_vectorbt_signal_executes_after_signal_date() -> None:
@@ -87,3 +89,81 @@ def test_vectorbt_parameter_set_changes_scores_and_applies_research_filters() ->
         "pa_score>=5.0",
         "risk_penalty<=2.0",
     }
+
+
+def test_vectorbt_research_view_avoids_false_corporate_action_loss() -> None:
+    if not VectorBTResearchAdapter.is_available():
+        pytest.skip("vectorbt is not installed")
+    daily = pd.DataFrame(
+        [
+            {
+                "date": "2019-12-31",
+                "symbol": "A",
+                "open": 20.0,
+                "high": 20.0,
+                "low": 20.0,
+                "close": 20.0,
+                "adj_open": 10.0,
+                "adj_high": 10.0,
+                "adj_low": 10.0,
+                "adj_close": 10.0,
+                "adj_factor": 1.0,
+                "volume": 1000,
+            },
+            {
+                "date": "2020-01-02",
+                "symbol": "A",
+                "open": 20.0,
+                "high": 20.0,
+                "low": 20.0,
+                "close": 20.0,
+                "adj_open": 10.0,
+                "adj_high": 10.0,
+                "adj_low": 10.0,
+                "adj_close": 10.0,
+                "adj_factor": 1.0,
+                "volume": 1000,
+            },
+            {
+                "date": "2020-01-03",
+                "symbol": "A",
+                "open": 10.0,
+                "high": 10.0,
+                "low": 10.0,
+                "close": 10.0,
+                "adj_open": 10.0,
+                "adj_high": 10.0,
+                "adj_low": 10.0,
+                "adj_close": 10.0,
+                "adj_factor": 2.0,
+                "volume": 1000,
+            },
+        ]
+    )
+    scores = pd.DataFrame(
+        [{"signal_date": "2019-12-31", "symbol": "A", "score": 1.0}]
+    )
+    parameters = VectorBTParameterSet(
+        top_n=1,
+        holding_period=1,
+        rebalance_frequency="daily",
+        commission_rate=0.0,
+        slippage_bps=0.0,
+    )
+
+    research_prices = WalkForwardTaskService._prepare_research_prices(daily)
+    execution_prices = WalkForwardTaskService._prepare_execution_prices(
+        daily,
+        state_history=None,
+        suspensions=None,
+    )
+    result = VectorBTResearchAdapter().run(
+        research_prices,
+        scores,
+        parameters,
+        initial_cash=100_000.0,
+    )
+
+    assert result.cumulative_return > -0.01
+    assert execution_prices["close"].tolist() == [20.0, 20.0, 10.0]
+    assert execution_prices["adj_factor"].tolist() == [1.0, 1.0, 2.0]
