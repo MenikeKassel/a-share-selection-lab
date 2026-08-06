@@ -31,6 +31,11 @@ POINT_IN_TIME_REQUIRED_COLUMNS = {
     "source",
     "content_hash",
 }
+# PR 5.2: explicit precision marker written at import time.  Parsed
+# timestamps lose the date-only/timestamp distinction after a Parquet
+# round-trip ("2024-01-02" becomes "2024-01-02 00:00:00"), so consumers
+# must read this column instead of re-deriving precision from strings.
+POINT_IN_TIME_PRECISION_COLUMN = "available_at_precision"
 UNAVAILABLE_MICROSTRUCTURE = {
     "cvd": "unavailable",
     "bid_ask_delta": "unavailable",

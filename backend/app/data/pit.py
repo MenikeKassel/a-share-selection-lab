@@ -36,12 +36,32 @@ def _parse_available(frame: pd.DataFrame) -> pd.Series:
     return pd.Series(available, index=frame.index, dtype="datetime64[ns]")
 
 
-def _date_only_mask(frame: pd.DataFrame, available: pd.Series) -> pd.Series:
-    """True when the record was published as a date without a time part."""
+def _date_only_mask(frame: pd.DataFrame, available: pd.Series | None) -> pd.Series:
+    """True when the record was published as a date without a time part.
+
+    PR 5.2: prefer the explicit ``available_at_precision`` column written
+    at import time (Parquet round-trips destroy string precision); fall
+    back to the raw string scan for legacy frames.
+    """
+    from app.data.contracts import POINT_IN_TIME_PRECISION_COLUMN
+
+    if POINT_IN_TIME_PRECISION_COLUMN in frame.columns:
+        precision = frame[POINT_IN_TIME_PRECISION_COLUMN].astype(str).str.strip().str.lower()
+        mask = precision.eq("date")
+        return pd.Series(mask, index=frame.index, dtype=bool)
     raw = frame["available_at"].astype(str).str.strip()
     has_time = raw.str.contains(r"[:T]", regex=True).fillna(False).astype(bool)
-    mask = (~has_time) & (available.dt.hour == _DATE_ONLY_HOUR)
+    mask = (
+        ~has_time
+        if available is None
+        else (~has_time) & (available.dt.hour == _DATE_ONLY_HOUR)
+    )
     return pd.Series(mask, index=frame.index, dtype=bool)
+
+
+def date_only_mask(frame: pd.DataFrame, available: pd.Series | None = None) -> pd.Series:
+    """Public precision-aware date-only detector (shared with as-of joins)."""
+    return _date_only_mask(frame, available)
 
 
 def _cutoff_for(day: pd.Timestamp, cutoff: time) -> pd.Timestamp:

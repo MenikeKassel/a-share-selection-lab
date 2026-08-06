@@ -33,13 +33,16 @@ def asof_join_available_data(
     right = point_in_time.copy()
     right["symbol"] = right["symbol"].astype(str)
     right["available_at"] = _as_shanghai_local_naive(right["available_at"])
-    # PR 5.1: a date-only record (no time part) is released at the close,
-    # not at 00:00:00.  Defer it to just PAST the 18:30 cutoff of its own
-    # date (microsecond offset) so a same-day signal cannot match it under
-    # backward as-of (previously treated as known at midnight -> intraday
-    # leakage); the next trading day's cutoff then sees it.
-    raw_available = point_in_time["available_at"].astype(str).str.strip()
-    date_only = ~raw_available.str.contains(r"[:T]", regex=True)
+    # PR 5.1/5.2: a date-only record (no time part) is released at the
+    # close, not at 00:00:00.  Defer it to just PAST the 18:30 cutoff of
+    # its own date (microsecond offset) so a same-day signal cannot match
+    # it under backward as-of (previously treated as known at midnight ->
+    # intraday leakage); the next trading day's cutoff then sees it.  The
+    # precision detection uses the explicit available_at_precision column
+    # when present (Parquet round-trips destroy string precision).
+    from app.data.pit import date_only_mask
+
+    date_only = date_only_mask(point_in_time)
     if date_only.any():
         deferred = right.loc[date_only, "available_at"].dt.normalize() + pd.Timedelta(
             hours=information_cutoff.hour,

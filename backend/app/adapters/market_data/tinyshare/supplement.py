@@ -684,6 +684,8 @@ def _normalise_valuations(rows: list[dict[str, Any]], calendar: pd.DataFrame) ->
     frame["period_end"] = frame["date"].dt.date.astype(str)
     frame["published_at"] = frame["date"].dt.strftime("%Y-%m-%d") + "T15:30:00+08:00"
     frame["available_at"] = frame["date"].dt.strftime("%Y-%m-%d") + "T18:30:00+08:00"
+    # PR 5.2: explicit precision marker survives Parquet round-trips.
+    frame["available_at_precision"] = "timestamp"
     frame["fetched_at"] = datetime.now().astimezone().isoformat()
     frame["source"] = "tinyshare.daily_basic"
     hash_columns = [
@@ -762,6 +764,8 @@ def _normalise_financials(rows: list[dict[str, Any]], calendar: pd.DataFrame) ->
     availability_base = published.fillna(frame["period_end"])
     next_trading_dates = _next_trading_dates(availability_base, calendar)
     frame["available_at"] = next_trading_dates.dt.strftime("%Y-%m-%d") + "T18:30:00+08:00"
+    # PR 5.2: explicit precision marker survives Parquet round-trips.
+    frame["available_at_precision"] = "timestamp"
     frame["fetched_at"] = datetime.now().astimezone().isoformat()
     frame["source"] = "tinyshare.financial_vip"
     mapping = {

@@ -155,3 +155,49 @@ def test_asof_join_date_only_record_not_visible_same_day() -> None:
     day_11 = joined.loc[joined["date"] == "2024-07-11"]
     assert pd.isna(day_10.iloc[0]["roe"])
     assert day_11.iloc[0]["roe"] == 0.10
+
+
+def test_asof_join_date_only_survives_parquet_round_trip() -> None:
+    """PR 5.2: after a Parquet round-trip a date-only string becomes
+    '2024-07-10 00:00:00' with a colon; the explicit precision column must
+    keep it classified as date-only so it still cannot leak same-day."""
+    import tempfile
+
+    from app.data.contracts import POINT_IN_TIME_PRECISION_COLUMN
+
+    frame = _pit_dataframe(date_only=True)
+    frame[POINT_IN_TIME_PRECISION_COLUMN] = "date"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/pit.parquet"
+        frame.to_parquet(path, index=False)
+        round_tripped = pd.read_parquet(path)
+
+    # Precision column survives the round-trip (pyarrow may store the value
+    # as date32 -> '2024-07-10', or as timestamp -> '2024-07-10 00:00:00');
+    # either way the explicit column, not the string shape, decides.
+    assert round_tripped[POINT_IN_TIME_PRECISION_COLUMN].tolist() == ["date"]
+    joined = asof_join_available_data(_daily_frame(), round_tripped)
+    day_10 = joined.loc[joined["date"] == "2024-07-10"]
+    day_11 = joined.loc[joined["date"] == "2024-07-11"]
+    assert pd.isna(day_10.iloc[0]["roe"])
+    assert day_11.iloc[0]["roe"] == 0.10
+
+
+def test_asof_join_precision_column_says_timestamp_keeps_same_day() -> None:
+    """PR 5.2: an explicit 'timestamp' precision keeps 18:29 same-day
+    visibility even after a Parquet round-trip."""
+    import tempfile
+
+    from app.data.contracts import POINT_IN_TIME_PRECISION_COLUMN
+
+    frame = _pit_dataframe()
+    frame[POINT_IN_TIME_PRECISION_COLUMN] = "timestamp"
+    with tempfile.TemporaryDirectory() as tmp:
+        path = f"{tmp}/pit.parquet"
+        frame.to_parquet(path, index=False)
+        round_tripped = pd.read_parquet(path)
+
+    joined = asof_join_available_data(_daily_frame(), round_tripped)
+    day_10 = joined.loc[joined["date"] == "2024-07-10"]
+    assert len(day_10) == 1
+    assert day_10.iloc[0]["roe"] == 0.10

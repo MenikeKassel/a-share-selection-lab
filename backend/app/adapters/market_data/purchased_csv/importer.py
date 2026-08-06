@@ -214,11 +214,20 @@ class PurchasedCsvSnapshotImporter:
             "capabilities": {
                 "historical_security_master": False,
                 "historical_security_state": False,
-                "pit_cutoff_enforced": False,
                 "real_listing_dates": False,
                 "explicit_corporate_actions": False,
                 "total_return_proxy_available": True,
                 "open_tradability_model": "daily_conservative",
+                # PR 5.2: split PIT capabilities by dataset.  Financials and
+                # valuations merge on available_at with an 18:30 boundary;
+                # industry/ST state uses effective-date as-of only (no
+                # publication time), so the global flag stays false until
+                # those datasets carry publication timestamps.
+                "pit_financials_enforced": True,
+                "pit_valuations_enforced": True,
+                "historical_state_effective_date_asof": True,
+                "historical_state_publication_time_pit": False,
+                "pit_cutoff_enforced": False,
             },
             "source": {
                 "type": "purchased_csv_archive",
