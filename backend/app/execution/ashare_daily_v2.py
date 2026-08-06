@@ -288,6 +288,13 @@ class AshareDailyV2ProxyEngine:
             commission = max(gross * request.commission_rate, request.minimum_commission)
             cash -= gross + commission
             adj_open = self._adj_open(row)
+            # PR 5.4: never fall back to the raw open.  A non-finite or
+            # non-positive adj_open means the causal total-return scale is
+            # unavailable; block the buy instead of silently mixing scales.
+            if not np.isfinite(adj_open) or adj_open <= 0:
+                failures.append(self._failure(trade_date, symbol, "missing_adj_open", "buy"))
+                cash += gross + commission
+                continue
             lot = PositionLot(
                 lot_id="",
                 symbol=symbol,
@@ -301,7 +308,7 @@ class AshareDailyV2ProxyEngine:
                 # inflate by the buy commission; the commission is already
                 # inside unit_cost and was deducted from cash.
                 raw_notional=gross,
-                adj_open=adj_open if adj_open > 0 else float(row["open"]),
+                adj_open=adj_open,
             )
             ledger.add_lot(lot)
             if existing is None:
@@ -311,7 +318,7 @@ class AshareDailyV2ProxyEngine:
                     last_buy_date=trade_date,
                     lots=[lot],
                     last_raw_close=float(row["open"]),
-                    last_adj_close=adj_open if adj_open > 0 else float(row["open"]),
+                    last_adj_close=adj_open,
                 )
             else:
                 existing.lots.append(lot)
@@ -361,7 +368,8 @@ class AshareDailyV2ProxyEngine:
             failures.append(self._failure(trade_date, symbol, blocked_reason, "sell"))
             return False, cash
         adj_open = self._adj_open(row)
-        if adj_open <= 0:
+        # PR 5.4: value-level check - NaN/Inf is as unusable as <= 0.
+        if not np.isfinite(adj_open) or adj_open <= 0:
             failures.append(self._failure(trade_date, symbol, "missing_adj_open", "sell"))
             return False, cash
 

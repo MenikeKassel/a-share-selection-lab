@@ -363,6 +363,83 @@ def test_proxy_engine_fails_closed_without_adj_open() -> None:
         AshareDailyV2ProxyEngine().run_with_data(_request(), market, signals)
 
 
+# ---------------------------------------------------------------------------
+# PR 5.4: value-level fail-closed (column present but invalid values)
+
+
+def test_proxy_engine_blocks_buy_when_adj_open_is_nan() -> None:
+    # Signal on 01-02 executes on 01-03; the execution day's adj_open must
+    # be NaN for the buy to be blocked.
+    market = _market(
+        [
+            {"date": "2024-01-02", "symbol": "A", "open": 10.0, "close": 10.0,
+             "volume": 1_000_000, "suspended": False, "industry": "tech",
+             "open_at_limit_up": False, "open_at_limit_down": False,
+             "adj_open": 10.0, "adj_close": 10.0},
+            {"date": "2024-01-03", "symbol": "A", "open": 10.0, "close": 10.0,
+             "volume": 1_000_000, "suspended": False, "industry": "tech",
+             "open_at_limit_up": False, "open_at_limit_down": False,
+             "adj_open": float("nan"), "adj_close": 10.0},
+        ]
+    )
+    signals = _signals(
+        [{"signal_date": "2024-01-02", "symbol": "A", "score": 1.0}]
+    )
+    result = AshareDailyV2ProxyEngine().run_with_data(_request(), market, signals)
+    # No raw-price fallback: the buy is blocked and no position is opened.
+    assert not any(trade["side"] == "buy" for trade in result.trades)
+    assert any(
+        failure["reason"] == "missing_adj_open" for failure in result.execution_failures
+    )
+
+
+def test_proxy_engine_blocks_buy_when_adj_open_is_zero() -> None:
+    # Signal on 01-02 executes on 01-03; the execution day's adj_open must
+    # also be invalid for the buy to be blocked.
+    market = _market(
+        [
+            {"date": "2024-01-02", "symbol": "A", "open": 10.0, "close": 10.0,
+             "volume": 1_000_000, "suspended": False, "industry": "tech",
+             "open_at_limit_up": False, "open_at_limit_down": False,
+             "adj_open": 10.0, "adj_close": 10.0},
+            {"date": "2024-01-03", "symbol": "A", "open": 10.0, "close": 10.0,
+             "volume": 1_000_000, "suspended": False, "industry": "tech",
+             "open_at_limit_up": False, "open_at_limit_down": False,
+             "adj_open": 0.0, "adj_close": 10.0},
+        ]
+    )
+    signals = _signals(
+        [{"signal_date": "2024-01-02", "symbol": "A", "score": 1.0}]
+    )
+    result = AshareDailyV2ProxyEngine().run_with_data(_request(), market, signals)
+    assert not any(trade["side"] == "buy" for trade in result.trades)
+    assert any(
+        failure["reason"] == "missing_adj_open" for failure in result.execution_failures
+    )
+
+
+def test_proxy_engine_never_uses_raw_open_as_adj_open() -> None:
+    """PR 5.4: even with a valid open price, an invalid adj_open must not
+    be substituted - the lot's adj_open must equal the real adjusted value."""
+    market = _market(
+        [
+            {"date": "2024-01-02", "symbol": "A", "open": 10.0, "close": 10.0,
+             "volume": 1_000_000, "suspended": False, "industry": "tech",
+             "open_at_limit_up": False, "open_at_limit_down": False,
+             "adj_open": 12.0, "adj_close": 12.0},
+            {"date": "2024-01-03", "symbol": "A", "open": 10.0, "close": 10.0,
+             "volume": 1_000_000, "suspended": False, "industry": "tech",
+             "open_at_limit_up": False, "open_at_limit_down": False,
+             "adj_open": 12.0, "adj_close": 12.0},
+        ]
+    )
+    signals = _signals(
+        [{"signal_date": "2024-01-02", "symbol": "A", "score": 1.0}]
+    )
+    result = AshareDailyV2ProxyEngine().run_with_data(_request(), market, signals)
+    assert any(trade["side"] == "buy" for trade in result.trades)
+
+
 def test_proxy_engine_fails_closed_without_open_at_limit() -> None:
     market = _market(
         [

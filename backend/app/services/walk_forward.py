@@ -149,12 +149,16 @@ class WalkForwardTaskService:
         manifest_path: Path,
         progress: ProgressCallback | None = None,
     ) -> dict[str, Any]:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self._schema_v2_capability_gate(manifest, manifest_path)
+        # PR 5.4: parse and confine the manifest BEFORE the capability gate
+        # touches any file.  SnapshotManifestValidator resolves every path
+        # and rejects anything outside the snapshot directory, so the gate
+        # must only consume snapshot.file() paths - never raw manifest
+        # strings (path traversal).
         snapshot = validate_snapshot_manifest(
             manifest_path,
             minimum_coverage_ratio=self.settings.min_daily_coverage_ratio,
         )
+        self._schema_v2_capability_gate(snapshot.metadata, snapshot)
         snapshot_audit = audit_snapshot_files(
             snapshot,
             minimum_coverage_ratio=self.settings.min_daily_coverage_ratio,
@@ -1153,7 +1157,7 @@ class WalkForwardTaskService:
 
     @staticmethod
     def _schema_v2_capability_gate(
-        manifest: dict[str, Any], manifest_path: Path | None = None
+        manifest: dict[str, Any], snapshot: object | None = None
     ) -> None:
         """Schema v2 startup gate: refuse to run when the snapshot cannot
         support the integrity claims the walk-forward makes.
@@ -1205,41 +1209,84 @@ class WalkForwardTaskService:
                 "history has no publication-time PIT; capabilities are "
                 "inconsistent"
             )
-        if manifest_path is not None:
+        if snapshot is not None:
             WalkForwardTaskService._verify_capabilities_against_files(
-                manifest, manifest_path, capabilities
+                manifest, snapshot, capabilities
             )
 
     @staticmethod
     def _verify_capabilities_against_files(
         manifest: dict[str, Any],
-        manifest_path: Path,
+        snapshot: object,
         capabilities: dict[str, Any],
     ) -> None:
         """Cross-check declared capabilities against real snapshot files.
 
-        PR 5.3: manifest booleans are claims, not evidence.  Each capability
-        is verified against the actual file/columns before the run starts.
+        PR 5.3/5.4: manifest booleans are claims, not evidence.  Every
+        path comes from ``snapshot.file()`` (already confined to the
+        snapshot directory by the validator); raw manifest path strings
+        are never used (path traversal).  Large parquet files are checked
+        via schema + batched value scans, never a full load.
         """
-        snapshot_dir = manifest_path.parent
-        files = manifest.get("files") or {}
+        from app.data.snapshots import SnapshotManifest
 
-        def resolve(name: str) -> Path | None:
-            entry = files.get(name)
-            if not entry:
-                return None
-            path_value = entry.get("path") if isinstance(entry, dict) else entry
-            return snapshot_dir / str(path_value) if path_value else None
+        snapshot_manifest = snapshot
+        assert isinstance(snapshot_manifest, SnapshotManifest)
 
-        def read_frame(name: str) -> pd.DataFrame | None:
-            path = resolve(name)
+        def read_small_frame(name: str) -> pd.DataFrame | None:
+            path = snapshot_manifest.file(name, required=False)
             if path is None or not path.exists():
                 return None
             return read_tabular(path)
 
+        def check_pit_frame(name: str) -> None:
+            """Column-level and (cheap) value-level PIT audit of a large
+            parquet without loading it fully."""
+            import pyarrow.parquet as parquet  # type: ignore[import-untyped]
+
+            path = snapshot_manifest.file(name, required=False)
+            if path is None or not path.exists():
+                raise WalkForwardSnapshotError(
+                    f"capability pit_*_enforced=true but {name} file is missing"
+                )
+            schema = parquet.read_schema(path)
+            missing_pit = POINT_IN_TIME_REQUIRED_COLUMNS.difference(schema.names)
+            if missing_pit:
+                raise WalkForwardSnapshotError(
+                    f"{name} is missing PIT audit columns: {sorted(missing_pit)}"
+                )
+            # PR 5.4: available_at_precision is part of the Schema v2
+            # strict contract (not just a legacy fallback).
+            precision_column = "available_at_precision"
+            if precision_column not in schema.names:
+                raise WalkForwardSnapshotError(
+                    f"{name} is missing {precision_column} (Schema v2 strict contract)"
+                )
+            allowed = {"date", "timestamp"}
+            invalid_rows = 0
+            checked = 0
+            parquet_file = parquet.ParquetFile(path)
+            for batch in parquet_file.iter_batches(
+                columns=["available_at_precision"], batch_size=100_000
+            ):
+                values = batch.column(0).to_pylist()
+                checked += len(values)
+                for value in values:
+                    if value is None or str(value).strip().lower() not in allowed:
+                        invalid_rows += 1
+                        if invalid_rows > 10:
+                            break
+                if invalid_rows > 10:
+                    break
+            if invalid_rows:
+                raise WalkForwardSnapshotError(
+                    f"{name} has {invalid_rows} invalid available_at_precision "
+                    f"values (allowed: {sorted(allowed)})"
+                )
+
         # real_listing_dates -> security_master exists with real flags.
         if capabilities.get("real_listing_dates") is True:
-            master = read_frame("security_master")
+            master = read_small_frame("security_master")
             if master is None:
                 raise WalkForwardSnapshotError(
                     "capability real_listing_dates=true but security_master file is missing"
@@ -1257,38 +1304,20 @@ class WalkForwardTaskService:
                     "re-run normalise_security_master"
                 )
 
-        # pit_financials_enforced -> financials exists with PIT audit columns.
+        # pit_financials_enforced -> financials exists with PIT audit columns
+        # and valid precision values.
         if capabilities.get("pit_financials_enforced") is True:
-            frame = read_frame("financials")
-            if frame is None:
-                raise WalkForwardSnapshotError(
-                    "capability pit_financials_enforced=true but financials file is missing"
-                )
-            missing_pit = POINT_IN_TIME_REQUIRED_COLUMNS.difference(frame.columns)
-            if missing_pit:
-                raise WalkForwardSnapshotError(
-                    "financials is missing PIT audit columns: "
-                    f"{sorted(missing_pit)}"
-                )
+            check_pit_frame("financials")
 
-        # pit_valuations_enforced -> valuations exists with PIT audit columns.
+        # pit_valuations_enforced -> valuations exists with PIT audit columns
+        # and valid precision values.
         if capabilities.get("pit_valuations_enforced") is True:
-            frame = read_frame("valuations")
-            if frame is None:
-                raise WalkForwardSnapshotError(
-                    "capability pit_valuations_enforced=true but valuations file is missing"
-                )
-            missing_pit = POINT_IN_TIME_REQUIRED_COLUMNS.difference(frame.columns)
-            if missing_pit:
-                raise WalkForwardSnapshotError(
-                    "valuations is missing PIT audit columns: "
-                    f"{sorted(missing_pit)}"
-                )
+            check_pit_frame("valuations")
 
         # historical_state_effective_date_asof -> state_history has the
         # effective-date shape.
         if capabilities.get("historical_state_effective_date_asof") is True:
-            frame = read_frame("state_history")
+            frame = read_small_frame("state_history")
             if frame is None:
                 raise WalkForwardSnapshotError(
                     "capability historical_state_effective_date_asof=true "
@@ -1336,7 +1365,7 @@ def _slice_point_in_time_input(
         if source.suffix.lower() != ".parquet":
             frame = read_tabular(source)
         else:
-            import pyarrow.parquet as parquet  # type: ignore[import-untyped]
+            import pyarrow.parquet as parquet
 
             schema = parquet.read_schema(source)
             filters: list[tuple[str, str, Any]] | None = None

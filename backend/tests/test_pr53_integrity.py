@@ -4,10 +4,7 @@ import json
 
 import pandas as pd
 import pytest
-from app.adapters.market_data.tinyshare.supplement import (
-    VALUATION_STORAGE_COLUMNS,
-    _normalise_valuations,
-)
+from app.adapters.market_data.tinyshare.supplement import VALUATION_STORAGE_COLUMNS
 from app.services.walk_forward import (
     WalkForwardSnapshotError,
     WalkForwardTaskService,
@@ -20,9 +17,14 @@ def _calendar() -> pd.DataFrame:
     )
 
 
-def test_valuation_storage_keeps_available_at_precision(tmp_path) -> None:
-    """PR 5.3: the precision column must survive the real storage path
-    (_normalise_valuations -> storage columns -> parquet round trip)."""
+def test_valuation_storage_keeps_available_at_precision(tmp_path: object) -> None:
+    """PR 5.3/5.4: the precision column must survive the REAL storage path
+    (_valuation_storage_frame -> storage columns -> parquet round trip)."""
+    import pathlib
+
+    from app.adapters.market_data.tinyshare.supplement import _valuation_storage_frame
+
+    tmp_path = pathlib.Path(str(tmp_path))
     rows = [
         {
             "ts_code": "000001.SZ",
@@ -36,7 +38,7 @@ def test_valuation_storage_keeps_available_at_precision(tmp_path) -> None:
             "volume_ratio": 1.2,
         }
     ]
-    frame = _normalise_valuations(rows, _calendar())
+    frame = _valuation_storage_frame(rows, _calendar())
     assert "available_at_precision" in frame.columns
     assert frame["available_at_precision"].eq("timestamp").all()
     assert "available_at_precision" in VALUATION_STORAGE_COLUMNS
@@ -49,9 +51,11 @@ def test_valuation_storage_keeps_available_at_precision(tmp_path) -> None:
 
 
 def test_capability_gate_verifies_security_master_file(tmp_path: object) -> None:
-    """PR 5.3: declared real_listing_dates=true must be backed by a real
+    """PR 5.3/5.4: declared real_listing_dates=true must be backed by a real
     security_master file with real flags."""
     import pathlib
+
+    from app.data.snapshots import SnapshotManifest
 
     tmp_path = pathlib.Path(str(tmp_path))
     manifest = {
@@ -65,9 +69,19 @@ def test_capability_gate_verifies_security_master_file(tmp_path: object) -> None
     }
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    snapshot = SnapshotManifest(
+        path=manifest_path,
+        snapshot_id="test",
+        immutable=True,
+        audit_valid=True,
+        coverage_ratio=1.0,
+        status="ready",
+        files={"security_master": tmp_path / "security_master.parquet"},
+        metadata=manifest,
+    )
     # Missing file -> blocked.
     with pytest.raises(WalkForwardSnapshotError, match="security_master file is missing"):
-        WalkForwardTaskService._schema_v2_capability_gate(manifest, manifest_path)
+        WalkForwardTaskService._schema_v2_capability_gate(manifest, snapshot)
 
     # File present but flags false -> blocked.
     pd.DataFrame(
@@ -77,13 +91,15 @@ def test_capability_gate_verifies_security_master_file(tmp_path: object) -> None
         ]
     ).to_parquet(tmp_path / "security_master.parquet", index=False)
     with pytest.raises(WalkForwardSnapshotError, match="non-real listing dates"):
-        WalkForwardTaskService._schema_v2_capability_gate(manifest, manifest_path)
+        WalkForwardTaskService._schema_v2_capability_gate(manifest, snapshot)
 
 
 def test_capability_gate_verifies_financials_file(tmp_path: object) -> None:
-    """PR 5.3: pit_financials_enforced=true requires financials with PIT
-    audit columns."""
+    """PR 5.3/5.4: pit_financials_enforced=true requires financials with
+    PIT audit columns AND the precision column (Schema v2 strict)."""
     import pathlib
+
+    from app.data.snapshots import SnapshotManifest
 
     tmp_path = pathlib.Path(str(tmp_path))
     manifest = {
@@ -97,6 +113,43 @@ def test_capability_gate_verifies_financials_file(tmp_path: object) -> None:
     }
     manifest_path = tmp_path / "manifest.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    snapshot = SnapshotManifest(
+        path=manifest_path,
+        snapshot_id="test",
+        immutable=True,
+        audit_valid=True,
+        coverage_ratio=1.0,
+        status="ready",
+        files={
+            "financials": tmp_path / "financials.parquet",
+            "valuations": tmp_path / "valuations.parquet",
+            "security_master": tmp_path / "security_master.parquet",
+        },
+        metadata=manifest,
+    )
+    # Valid security master and valuations so the financials check is the
+    # first failure.
+    pd.DataFrame(
+        [
+            {"symbol": "000001.SZ", "list_date": "1991-04-03",
+             "is_real_listing_date": True, "listing_date_source": "purchased"}
+        ]
+    ).to_parquet(tmp_path / "security_master.parquet", index=False)
+    pd.DataFrame(
+        [
+            {
+                "symbol": "000001.SZ",
+                "period_end": "2024-06-30",
+                "published_at": "2024-07-10 18:30:00",
+                "available_at": "2024-07-10 18:30:00",
+                "available_at_precision": "timestamp",
+                "fetched_at": "2024-07-10 19:00:00",
+                "source": "test",
+                "content_hash": "x",
+            }
+        ]
+    ).to_parquet(tmp_path / "valuations.parquet", index=False)
+    # Missing precision column -> blocked with the strict-contract message.
     pd.DataFrame(
         [
             {
@@ -110,11 +163,14 @@ def test_capability_gate_verifies_financials_file(tmp_path: object) -> None:
             }
         ]
     ).to_parquet(tmp_path / "financials.parquet", index=False)
-    # All PIT columns present -> passes the financials check (then fails on
-    # the missing security_master for real_listing_dates; assert the error
-    # is NOT about financials).
-    with pytest.raises(WalkForwardSnapshotError, match="security_master"):
-        WalkForwardTaskService._schema_v2_capability_gate(manifest, manifest_path)
+    with pytest.raises(WalkForwardSnapshotError, match="available_at_precision"):
+        WalkForwardTaskService._schema_v2_capability_gate(manifest, snapshot)
+
+    # With a valid precision column -> all capability checks pass.
+    frame = pd.read_parquet(tmp_path / "financials.parquet")
+    frame["available_at_precision"] = "timestamp"
+    frame.to_parquet(tmp_path / "financials.parquet", index=False)
+    WalkForwardTaskService._schema_v2_capability_gate(manifest, snapshot)
 
 
 def test_open_at_limit_uses_tick_tolerance_not_proportional_band() -> None:
