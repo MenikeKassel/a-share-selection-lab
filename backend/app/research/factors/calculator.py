@@ -33,6 +33,21 @@ def asof_join_available_data(
     right = point_in_time.copy()
     right["symbol"] = right["symbol"].astype(str)
     right["available_at"] = _as_shanghai_local_naive(right["available_at"])
+    # PR 5.1: a date-only record (no time part) is released at the close,
+    # not at 00:00:00.  Defer it to just PAST the 18:30 cutoff of its own
+    # date (microsecond offset) so a same-day signal cannot match it under
+    # backward as-of (previously treated as known at midnight -> intraday
+    # leakage); the next trading day's cutoff then sees it.
+    raw_available = point_in_time["available_at"].astype(str).str.strip()
+    date_only = ~raw_available.str.contains(r"[:T]", regex=True)
+    if date_only.any():
+        deferred = right.loc[date_only, "available_at"].dt.normalize() + pd.Timedelta(
+            hours=information_cutoff.hour,
+            minutes=information_cutoff.minute,
+            seconds=information_cutoff.second,
+            microseconds=1,
+        )
+        right.loc[date_only, "available_at"] = deferred
 
     joined: list[pd.DataFrame] = []
     right_groups = right.groupby("symbol", sort=False)

@@ -28,6 +28,11 @@ from app.adapters.vectorbt.adapter import VectorBTResearchAdapter
 from app.api.schemas import WalkForwardRunRequest
 from app.core.config import Settings
 from app.data.history import join_historical_state
+from app.data.security_master import (
+    SecurityMasterStatus,
+    listing_days_for,
+    normalise_security_master,
+)
 from app.data.snapshots import (
     SnapshotManifestError,
     audit_snapshot_files,
@@ -162,6 +167,33 @@ class WalkForwardTaskService:
         daily = self._read_manifest_frame(manifest, manifest_path, "daily")
         if daily is None:
             raise WalkForwardSnapshotError("snapshot manifest is missing daily data")
+        # PR 5.1: real listing dates, when the snapshot ships a security
+        # master.  Fallback universes keep NaN listing_days (the new-listing
+        # filter then requires explicit capability to stay enabled).
+        self._security_master_status: SecurityMasterStatus | None = None
+        try:
+            security_master = self._read_manifest_frame(
+                manifest, manifest_path, "security_master", required=False
+            )
+        except WalkForwardSnapshotError:
+            security_master = None
+        if security_master is not None and not security_master.empty:
+            if "is_real_listing_date" not in security_master.columns:
+                security_master, master_status = normalise_security_master(security_master)
+            else:
+                master_status = SecurityMasterStatus(
+                    real_listing_dates=bool(security_master["is_real_listing_date"].all()),
+                    listing_date_source=str(
+                        security_master["listing_date_source"].iloc[0]
+                        if "listing_date_source" in security_master
+                        else "purchased_security_master"
+                    ),
+                    row_count=len(security_master),
+                )
+            self._security_master_status = master_status
+            listing_days, _ = listing_days_for(daily, security_master, master_status)
+            daily = daily.copy()
+            daily["listing_days"] = listing_days.to_numpy()
         benchmark = self._read_manifest_frame(manifest, manifest_path, "benchmark")
         financials = self._read_manifest_frame(manifest, manifest_path, "financials")
         valuation_path = snapshot.file("valuations")
@@ -210,6 +242,11 @@ class WalkForwardTaskService:
             benchmark=benchmark,
             industry=industry,
             state_history=state_history,
+            security_master=(
+                security_master
+                if "security_master" in locals() and security_master is not None
+                else None
+            ),
             start_date=payload.start_date,
             end_date=payload.end_date,
             data_snapshot_version=str(
@@ -302,6 +339,7 @@ class WalkForwardTaskService:
         benchmark: pd.DataFrame | None,
         industry: pd.DataFrame | None,
         state_history: pd.DataFrame,
+        security_master: pd.DataFrame | None = None,
         start_date: date,
         end_date: date,
         data_snapshot_version: str,
@@ -378,6 +416,7 @@ class WalkForwardTaskService:
                 benchmark=chunk_benchmark,
                 industry_rps=chunk_industry,
                 state_history=chunk_state,
+                security_master=security_master,
                 start_date=output_start,
                 end_date=output_end,
                 data_snapshot_version=data_snapshot_version,

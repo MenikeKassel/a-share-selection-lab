@@ -28,6 +28,8 @@ SECURITY_MASTER_COLUMNS = [
     "exchange",
     "board",
     "security_type",
+    "is_real_listing_date",
+    "listing_date_source",
 ]
 
 
@@ -86,17 +88,23 @@ def normalise_security_master(universe: pd.DataFrame) -> tuple[pd.DataFrame, Sec
         listing_date_source="purchased_security_master" if real else "daily_first_observed",
         row_count=len(master),
     )
+    # PR 5.1: propagate the capability per row so listing_days_for() can
+    # read it back when no explicit status is passed.
+    master["is_real_listing_date"] = real
+    master["listing_date_source"] = status.listing_date_source
     return master[SECURITY_MASTER_COLUMNS].sort_values("symbol").reset_index(drop=True), status
 
 
 def listing_days_for(
     market: pd.DataFrame,
     security_master: pd.DataFrame,
+    status: SecurityMasterStatus | None = None,
 ) -> tuple[pd.Series, SecurityMasterStatus]:
-    """Compute listing_days from the real list_date.
+    """Compute listing_days from the security master's list_date.
 
-    Returns the series aligned to ``market`` order plus the master status.
     Missing list_date produces NaN (never silently the data window start).
+    The returned status propagates the master's real-listing-date
+    capability: a fallback master stays marked as fallback (PR 5.1).
     """
     if security_master.empty:
         raise ValueError("security master is empty; cannot compute real listing days")
@@ -107,11 +115,19 @@ def listing_days_for(
     market_symbols = market["symbol"].astype(str)
     list_dates = market_symbols.map(lookup)
     market_dates = pd.to_datetime(market["date"], format="mixed", errors="coerce")
-    status = SecurityMasterStatus(
-        real_listing_dates=True,
-        listing_date_source="purchased_security_master",
-        row_count=len(master),
-    )
+    if status is None:
+        source_column = master.get("listing_date_source")
+        source_value = (
+            str(pd.Series(source_column).iloc[0])
+            if source_column is not None and not pd.Series(source_column).empty
+            else "purchased_security_master"
+        )
+        real = bool(master.get("is_real_listing_date", pd.Series(True)).all())
+        status = SecurityMasterStatus(
+            real_listing_dates=real,
+            listing_date_source=source_value,
+            row_count=len(master),
+        )
     return (market_dates - list_dates).dt.days.astype(float), status
 
 

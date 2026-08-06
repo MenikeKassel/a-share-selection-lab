@@ -62,6 +62,8 @@ def test_normalise_security_master_real_listing_dates() -> None:
         "exchange",
         "board",
         "security_type",
+        "is_real_listing_date",
+        "listing_date_source",
     ]
     by_symbol = master.set_index("symbol")
     assert by_symbol.loc["000001.SZ", "exchange"] == "SZSE"

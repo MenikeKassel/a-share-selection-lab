@@ -77,6 +77,7 @@ class HistoricalSignalGenerator:
         benchmark: pd.DataFrame | None = None,
         industry_rps: pd.DataFrame | None = None,
         state_history: pd.DataFrame | None = None,
+        security_master: pd.DataFrame | None = None,
         data_snapshot_version: str | None = None,
         start_date: date | None = None,
         end_date: date | None = None,
@@ -94,6 +95,15 @@ class HistoricalSignalGenerator:
         if max_candidates_per_date < 1:
             raise ValueError("max_candidates_per_date must be positive")
         market = self._prepare_market(daily, state_history=state_history)
+        if security_master is not None and not security_master.empty:
+            # PR 5.1: real listing dates from the security master override
+            # any importer-derived value; missing list_date stays NaN and
+            # the new-listing filter rejects those symbols.
+            from app.data.security_master import listing_days_for
+
+            listing_days, _ = listing_days_for(market, security_master)
+            market = market.copy()
+            market["listing_days"] = listing_days.to_numpy()
         self._validate_point_in_time_dataset(financials, "financials")
         self._validate_point_in_time_dataset(valuations, "valuations")
         if trading_dates is not None:
