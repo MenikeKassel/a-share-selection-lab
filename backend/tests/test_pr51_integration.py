@@ -157,6 +157,101 @@ def test_asof_join_date_only_record_not_visible_same_day() -> None:
     assert day_11.iloc[0]["roe"] == 0.10
 
 
+def test_asof_join_drops_audit_metadata_columns() -> None:
+    """PR 6.5: the merged frame must not carry PIT audit metadata copies
+    (the 100+ column balloon that caused the 10M-row valuations OOM)."""
+    daily = pd.DataFrame(
+        [
+            {"date": "2024-07-11", "symbol": "A", "close": 10.0},
+            {"date": "2024-07-11", "symbol": "B", "close": 20.0},
+        ]
+    )
+    pit = pd.DataFrame(
+        [
+            {
+                "symbol": "A",
+                "period_end": "2024-06-30",
+                "published_at": "2024-07-10 15:30:00",
+                "available_at": "2024-07-10 18:30:00",
+                "fetched_at": "2024-07-10 19:00:00",
+                "source": "test",
+                "content_hash": "abc",
+                "available_at_precision": "timestamp",
+                "pe_ttm": 5.0,
+                "pb": 0.6,
+            }
+        ]
+    )
+    joined = asof_join_available_data(daily, pit)
+    assert {"pe_ttm", "pb"}.issubset(joined.columns)
+    for column in (
+        "fetched_at",
+        "source",
+        "content_hash",
+        "available_at_precision",
+        "period_end",
+        "published_at",
+    ):
+        assert column not in joined.columns
+    assert joined["pe_ttm"].iloc[0] == 5.0
+
+
+def test_asof_join_keep_columns_limits_right_side() -> None:
+    """PR 6.5: explicit keep_columns restricts the merge to factor columns."""
+    daily = pd.DataFrame(
+        [
+            {"date": "2024-07-11", "symbol": "A", "close": 10.0},
+        ]
+    )
+    pit = pd.DataFrame(
+        [
+            {
+                "symbol": "A",
+                "period_end": "2024-06-30",
+                "published_at": "2024-07-10 15:30:00",
+                "available_at": "2024-07-10 18:30:00",
+                "fetched_at": "2024-07-10 19:00:00",
+                "source": "test",
+                "content_hash": "abc",
+                "available_at_precision": "timestamp",
+                "pe_ttm": 5.0,
+                "pb": 0.6,
+            }
+        ]
+    )
+    joined = asof_join_available_data(daily, pit, keep_columns={"pe_ttm"})
+    assert "pe_ttm" in joined.columns
+    assert "pb" not in joined.columns
+
+
+def test_asof_join_reindexes_without_reset_index() -> None:
+    """PR 6.5: the output index is a clean RangeIndex (sorted order)."""
+    daily = pd.DataFrame(
+        [
+            {"date": "2024-07-11", "symbol": "B", "close": 20.0},
+            {"date": "2024-07-11", "symbol": "A", "close": 10.0},
+        ]
+    )
+    pit = pd.DataFrame(
+        [
+            {
+                "symbol": "A",
+                "period_end": "2024-06-30",
+                "published_at": "2024-07-10 15:30:00",
+                "available_at": "2024-07-10 18:30:00",
+                "fetched_at": "2024-07-10 19:00:00",
+                "source": "test",
+                "content_hash": "abc",
+                "available_at_precision": "timestamp",
+                "pe_ttm": 5.0,
+            }
+        ]
+    )
+    joined = asof_join_available_data(daily, pit)
+    assert list(joined.index) == list(range(len(joined)))
+    assert joined["symbol"].tolist() == ["A", "B"]
+
+
 def test_asof_join_date_only_survives_parquet_round_trip() -> None:
     """PR 5.2: after a Parquet round-trip a date-only string becomes
     '2024-07-10 00:00:00' with a colon; the explicit precision column must

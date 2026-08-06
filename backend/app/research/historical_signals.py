@@ -376,7 +376,9 @@ class HistoricalSignalGenerator:
         if "list_date" in market:
             list_dates = pd.to_datetime(market["list_date"], format="mixed", errors="coerce")
             market["listing_days"] = (market["date"] - list_dates).dt.days.astype(float)
-        return market.sort_values(["date", "symbol"]).reset_index(drop=True)
+        market.sort_values(["date", "symbol"], inplace=True)
+        market.index = pd.RangeIndex(len(market))
+        return market
 
     @staticmethod
     def _validate_point_in_time_dataset(

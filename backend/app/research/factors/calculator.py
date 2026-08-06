@@ -13,8 +13,15 @@ def asof_join_available_data(
     point_in_time: pd.DataFrame,
     *,
     information_cutoff: time = time(18, 30),
+    keep_columns: set[str] | None = None,
 ) -> pd.DataFrame:
-    """Join records known by the reproducible after-close selection cutoff."""
+    """Join records known by the reproducible after-close selection cutoff.
+
+    ``keep_columns`` limits the right-hand side to the factor columns the
+    caller needs.  When omitted, the PIT audit metadata columns are dropped
+    (fetched_at/source/content_hash/available_at_precision/period_end) so
+    the merged frame does not balloon to 100+ columns of audit copies.
+    """
     required = {"symbol", "available_at"}
     if missing := required.difference(point_in_time.columns):
         raise ValueError(f"point-in-time data is missing columns: {sorted(missing)}")
@@ -22,6 +29,27 @@ def asof_join_available_data(
         raise ValueError(
             f"point-in-time data is missing audit metadata: {sorted(metadata_missing)}"
         )
+    right_columns = {"symbol", "available_at"}
+    if keep_columns is not None:
+        right_columns |= keep_columns
+    else:
+        # PR 6.5: only factor-relevant columns survive the join; audit
+        # metadata is verified above but never merged into the daily frame.
+        right_columns |= {
+            column
+            for column in point_in_time.columns
+            if column
+            not in (
+                "fetched_at",
+                "source",
+                "content_hash",
+                "available_at_precision",
+                "period_end",
+                "published_at",
+                "date",
+            )
+        }
+    point_in_time = point_in_time.loc[:, sorted(right_columns & set(point_in_time.columns))]
     left = daily.copy()
     left["date"] = _as_shanghai_local_naive(left["date"]).dt.normalize()
     left["symbol"] = left["symbol"].astype(str)
@@ -74,7 +102,12 @@ def asof_join_available_data(
             )
         )
     output = pd.concat(joined, ignore_index=True).drop(columns=["_asof_timestamp"])
-    return output.sort_values(["date", "symbol"]).reset_index(drop=True)
+    # PR 6.5: reindex WITHOUT the deep copy that reset_index performs
+    # (reset_index -> copy -> consolidate allocates a full second frame;
+    # on the 10M-row valuations path that single allocation was the OOM).
+    output.sort_values(["date", "symbol"], inplace=True)
+    output.index = pd.RangeIndex(len(output))
+    return output
 
 
 def _as_shanghai_local_naive(values: pd.Series) -> pd.Series:
@@ -159,7 +192,10 @@ class DailyFactorCalculator:
             output = asof_join_available_data(output, valuations)
         output = self._valuation_percentiles(output)
         output["data_quality_risk"] = self._data_quality_risk(output)
-        return output.sort_values(["date", "symbol"]).reset_index(drop=True)
+        # PR 6.5: avoid reset_index deep copy on the merged output.
+        output.sort_values(["date", "symbol"], inplace=True)
+        output.index = pd.RangeIndex(len(output))
+        return output
 
     def _calculate_symbol(self, group: pd.DataFrame) -> pd.DataFrame:
         close = pd.to_numeric(group["close"], errors="coerce")
