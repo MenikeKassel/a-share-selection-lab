@@ -610,6 +610,44 @@ class WalkForwardTaskService:
         if "list_date" in prices:
             list_dates = pd.to_datetime(prices["list_date"], format="mixed", errors="coerce")
             prices["listing_days"] = (prices["date"] - list_dates).dt.days.astype(float)
+        # PR 6.7: legacy snapshots imported before PR 5.3 lack the v2
+        # open-limit columns.  Derive them from the SAME rule table and
+        # half-tick tolerance as the importer so the v2 proxy engine can
+        # run without rewriting the immutable snapshot files (their
+        # SHA-256 fingerprints stay valid).
+        missing_open_limits = {
+            "open_at_limit_up",
+            "open_at_limit_down",
+            "limit_up_price",
+            "limit_down_price",
+        }.difference(prices.columns)
+        if missing_open_limits and "pre_close" in prices.columns:
+            from app.adapters.market_data.purchased_csv.importer import _limit_prices_for_row
+
+            tick_tolerance = 0.005
+            pre_close_numeric = pd.to_numeric(prices["pre_close"], errors="coerce")
+            valid_pre_close = pre_close_numeric.notna() & (pre_close_numeric > 0)
+            limit_rows = prices.loc[valid_pre_close].apply(
+                lambda row: _limit_prices_for_row(row),
+                axis=1,
+                result_type="expand",
+            )
+            valid_positions = valid_pre_close.to_numpy()
+            limit_up_array = np.zeros(len(prices), dtype=float)
+            limit_down_array = np.zeros(len(prices), dtype=float)
+            up_values = limit_rows.iloc[:, 0].to_numpy(dtype=float)
+            down_values = limit_rows.iloc[:, 1].to_numpy(dtype=float)
+            limit_up_array[valid_positions] = up_values
+            limit_down_array[valid_positions] = down_values
+            prices["limit_up_price"] = limit_up_array
+            prices["limit_down_price"] = limit_down_array
+            open_numeric = pd.to_numeric(prices["open"], errors="coerce")
+            prices["open_at_limit_up"] = (prices["limit_up_price"] > 0) & (
+                open_numeric >= (prices["limit_up_price"] - tick_tolerance)
+            )
+            prices["open_at_limit_down"] = (prices["limit_down_price"] > 0) & (
+                open_numeric <= (prices["limit_down_price"] + tick_tolerance)
+            )
         if suspensions is not None and not suspensions.empty:
             required = {"date", "symbol"}
             if required.issubset(suspensions.columns):
@@ -644,7 +682,16 @@ class WalkForwardTaskService:
             for column in execution_columns
             if column in prices
         ]
-        for column in ("industry", "is_st", "delisting_risk", "suspended"):
+        for column in (
+            "industry",
+            "is_st",
+            "delisting_risk",
+            "suspended",
+            "open_at_limit_up",
+            "open_at_limit_down",
+            "limit_up_price",
+            "limit_down_price",
+        ):
             if column in prices and column not in result_columns:
                 result_columns.append(column)
         return prices.loc[:, result_columns].sort_values(["date", "symbol"]).reset_index(

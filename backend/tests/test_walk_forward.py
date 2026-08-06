@@ -645,6 +645,71 @@ def test_run_split_validation_decides_test_metrics_do_not(monkeypatch) -> None:
     assert len(test_calls) >= 2  # formal + stress
 
 
+def test_execution_view_derives_open_limits_for_legacy_snapshot() -> None:
+    """PR 6.7: a pre-PR5.3 snapshot without open_at_limit_*/limit_*_price
+    columns must get them derived from the rule table at view build time."""
+    daily = pd.DataFrame(
+        [
+            {
+                "date": "2025-01-02",
+                "symbol": "000001.SZ",
+                "open": 11.99,
+                "high": 12.0,
+                "low": 11.5,
+                "close": 12.0,
+                "pre_close": 10.9,
+                "volume": 1_000_000,
+                "amount": 12_000_000.0,
+                "adj_factor": 1.0,
+                "adj_open": 11.99,
+                "adj_close": 12.0,
+                "is_st": False,
+                "suspended": False,
+            }
+        ]
+    )
+    prices = WalkForwardTaskService._prepare_execution_prices(
+        daily,
+        state_history=None,
+        suspensions=None,
+    )
+    # pre_close 10.90 -> 10% band -> limit_up 11.99 (rounded), so the
+    # open of 11.99 sits at the limit.
+    assert prices["limit_up_price"].iloc[0] > 0
+    assert bool(prices["open_at_limit_up"].iloc[0]) is True
+    assert bool(prices["open_at_limit_down"].iloc[0]) is False
+    assert {"adj_open", "adj_close"}.issubset(prices.columns)
+
+
+def test_execution_view_derivation_handles_nan_pre_close() -> None:
+    """PR 6.7: NaN pre_close rows must not crash Decimal conversion; their
+    limit prices fall back to 0 (the engine fail-closes on them)."""
+    daily = pd.DataFrame(
+        [
+            {
+                "date": "2025-01-02",
+                "symbol": "000001.SZ",
+                "open": 10.0,
+                "close": 10.0,
+                "pre_close": float("nan"),
+                "volume": 1_000_000,
+                "adj_factor": 1.0,
+                "adj_open": 10.0,
+                "adj_close": 10.0,
+                "is_st": False,
+                "suspended": False,
+            }
+        ]
+    )
+    prices = WalkForwardTaskService._prepare_execution_prices(
+        daily,
+        state_history=None,
+        suspensions=None,
+    )
+    assert prices["limit_up_price"].iloc[0] == 0.0
+    assert bool(prices["open_at_limit_up"].iloc[0]) is False
+
+
 def test_schema_v2_gate_blocks_legacy_manifest() -> None:
     with pytest.raises(
         WalkForwardSnapshotError, match="schema_version < 2"
