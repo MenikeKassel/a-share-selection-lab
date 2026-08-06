@@ -264,17 +264,30 @@ class WalkForwardTaskService:
             raise WalkForwardSnapshotError(
                 "historical signal generator produced no eligible signals"
             )
+        # PR 6.6: release the heavy PIT inputs before building the dual
+        # price views.  daily/state_history/suspensions are still needed,
+        # but financials/valuations/benchmark/industry/security_master
+        # have served their purpose (signals are materialised) - keeping
+        # them alive through the view build pushed the process past the
+        # 32GB machine limit on a full 2018-2025 replay (MemoryError).
+        import gc
+
+        del financials, valuations, industry, security_master
+        gc.collect()
         suspensions = self._read_manifest_frame(
             manifest, manifest_path, "suspensions", required=False
         )
         research_daily = _date_filter(daily, "date", payload.start_date, payload.end_date)
         research_prices = self._prepare_research_prices(research_daily)
+        del research_daily
         execution_daily = _date_filter(daily, "date", payload.start_date, payload.end_date)
         execution_prices = self._prepare_execution_prices(
             execution_daily,
             state_history=state_history,
             suspensions=suspensions,
         )
+        del execution_daily, daily, state_history, suspensions
+        gc.collect()
         splits = generate_annual_walk_forward_splits(
             first_train_year=2018,
             final_test_year=2025,
