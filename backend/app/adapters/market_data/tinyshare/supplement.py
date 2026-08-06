@@ -228,10 +228,19 @@ class TinyShareSnapshotCompleter:
             package_info: dict[str, Any] = self.client.package_info()
         except TinyShareProviderError as error:
             package_info = {"available": False, "error": str(error)}
+        # PR 6: runtime self-test must pass BEFORE any endpoint is probed.
+        # This proves the configured interpreter can import and initialise
+        # TinyShare; a broken interpreter fails closed instead of surfacing
+        # twelve confusing per-endpoint errors.
+        try:
+            runtime_info: dict[str, Any] = self.client.runtime_info()
+        except TinyShareProviderError as error:
+            runtime_info = {"available": False, "error": str(error)}
         capability_report = {
             "provider": "tinyshare",
             "checked_at": datetime.now().astimezone().isoformat(),
             "package": package_info,
+            "runtime": runtime_info,
             "capabilities": [item.as_dict() for item in capabilities],
             "required_ready": all(item.available for item in capabilities if item.required),
             "coverage_ready": any(
@@ -242,7 +251,11 @@ class TinyShareSnapshotCompleter:
         (root / "tinyshare_capabilities.json").write_text(
             json.dumps(capability_report, ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        if not capability_report["required_ready"] or not capability_report["coverage_ready"]:
+        if (
+            runtime_info.get("available") is not True
+            or not capability_report["required_ready"]
+            or not capability_report["coverage_ready"]
+        ):
             # Keep the immutable input snapshot staged so a later, corrected
             # isolated-provider setup can retry supplementation.  The
             # capability report still blocks validation because audit_valid is

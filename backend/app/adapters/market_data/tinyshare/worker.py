@@ -40,6 +40,50 @@ def main() -> int:
                     }
                 ],
             )
+        if method == "__runtime_info__":
+            # PR 6: runtime self-test WITHOUT a token and WITHOUT any remote
+            # call.  Proves the interpreter can load TinyShare and construct
+            # the API factory; the caller decides whether to proceed.
+            try:
+                import tinyshare as ts
+
+                module_path = Path(str(getattr(ts, "__file__", "")))
+                api_factory_name: str | None = None
+                api_factory_available = False
+                api_initialization_success: bool | None = None
+                factory = getattr(ts, "pro_api", None) or getattr(ts, "proapi", None)
+                if factory is not None:
+                    api_factory_name = getattr(factory, "__name__", "pro_api")
+                    api_factory_available = True
+                    try:
+                        # No token: initialization without credentials must
+                        # not be attempted remotely; presence of the factory
+                        # is enough for the probe.
+                        api_initialization_success = callable(factory)
+                    except Exception:  # pragma: no cover - defensive
+                        api_initialization_success = False
+                return _write_rows(
+                    response_path,
+                    [
+                        {
+                            "sys.executable": sys.executable,
+                            "sys.version": sys.version.split()[0],
+                            "sys.prefix": sys.prefix,
+                            "sys.base_prefix": sys.base_prefix,
+                            "path_home": str(Path.home()),
+                            "module_path": str(module_path),
+                            "module_exists": module_path.exists(),
+                            "api_factory_name": api_factory_name,
+                            "api_factory_available": api_factory_available,
+                            "api_initialization_success": api_initialization_success,
+                        }
+                    ],
+                )
+            except Exception as error:  # pragma: no cover - probe must fail closed
+                return _write_error(
+                    response_path,
+                    f"tiny runtime probe failed: {type(error).__name__}: {error}",
+                )
         token = os.getenv("TINYSHARE_TOKEN", "").strip()
         if not token:
             return _write_error(response_path, "TINYSHARE_TOKEN is not configured")

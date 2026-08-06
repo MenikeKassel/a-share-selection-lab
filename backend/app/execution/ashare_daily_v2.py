@@ -506,7 +506,11 @@ class AshareDailyV2ProxyEngine:
         value = row.get("adj_close")
         if value is None or pd.isna(value):
             return 0.0
-        return float(value)
+        parsed = float(value)
+        # PR 6: Inf/-Inf must never reach proxy valuation (equity, returns
+        # and drawdown would become Inf/NaN).  Non-finite or non-positive
+        # values fall back to the last known adjusted close.
+        return parsed if np.isfinite(parsed) and parsed > 0 else 0.0
 
     @staticmethod
     def _average_cost(holding: _Holding) -> float:

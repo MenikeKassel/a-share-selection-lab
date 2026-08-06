@@ -1262,26 +1262,64 @@ class WalkForwardTaskService:
                 raise WalkForwardSnapshotError(
                     f"{name} is missing {precision_column} (Schema v2 strict contract)"
                 )
+            # PR 6: also verify temporal relations inside each batch so the
+            # 10M-row valuations file gets the same audit as financials
+            # (which is fully validated later via validate_point_in_time_frame).
+            temporal_columns = ["available_at_precision", "published_at", "available_at"]
+            if not set(temporal_columns).issubset(schema.names):
+                raise WalkForwardSnapshotError(
+                    f"{name} is missing temporal PIT columns: "
+                    f"{sorted(set(temporal_columns).difference(schema.names))}"
+                )
             allowed = {"date", "timestamp"}
             invalid_rows = 0
             checked = 0
+            unparsable = 0
+            backwards = 0
+            empty_time = 0
             parquet_file = parquet.ParquetFile(path)
             for batch in parquet_file.iter_batches(
-                columns=["available_at_precision"], batch_size=100_000
+                columns=temporal_columns, batch_size=100_000
             ):
-                values = batch.column(0).to_pylist()
-                checked += len(values)
-                for value in values:
-                    if value is None or str(value).strip().lower() not in allowed:
-                        invalid_rows += 1
-                        if invalid_rows > 10:
-                            break
-                if invalid_rows > 10:
+                frame_batch = batch.to_pandas()
+                checked += len(frame_batch)
+                precision_values = (
+                    frame_batch["available_at_precision"]
+                    .astype(str)
+                    .str.strip()
+                    .str.lower()
+                )
+                invalid_rows += int(
+                    (~precision_values.isin(allowed)).sum()
+                )
+                published = pd.to_datetime(
+                    frame_batch["published_at"], format="mixed", errors="coerce"
+                )
+                available = pd.to_datetime(
+                    frame_batch["available_at"], format="mixed", errors="coerce"
+                )
+                unparsable += int(published.isna().sum() + available.isna().sum())
+                backwards += int((available < published).sum())
+                # timestamp precision must not be a bare midnight (a
+                # date-only value mislabelled as timestamp).
+                timestamp_mask = precision_values.eq("timestamp")
+                if timestamp_mask.any():
+                    midnight = available.dt.normalize() == available
+                    empty_time += int((timestamp_mask & midnight).sum())
+                if invalid_rows > 10 or unparsable > 10 or backwards > 10 or empty_time > 10:
                     break
+            problems: list[str] = []
             if invalid_rows:
+                problems.append(f"{invalid_rows} invalid available_at_precision")
+            if unparsable:
+                problems.append(f"{unparsable} unparsable published_at/available_at")
+            if backwards:
+                problems.append(f"{backwards} available_at earlier than published_at")
+            if empty_time:
+                problems.append(f"{empty_time} timestamp precision at midnight (date-only)")
+            if problems:
                 raise WalkForwardSnapshotError(
-                    f"{name} has {invalid_rows} invalid available_at_precision "
-                    f"values (allowed: {sorted(allowed)})"
+                    f"{name} PIT audit failed: {'; '.join(problems)}"
                 )
 
         # real_listing_dates -> security_master exists with real flags.

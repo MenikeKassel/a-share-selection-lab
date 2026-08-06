@@ -69,6 +69,40 @@ class TinyShareIsolatedClient:
             raise TinyShareProviderError("TinyShare package inspection returned no metadata")
         return rows[0]
 
+    def runtime_info(self) -> dict[str, Any]:
+        """PR 6: run the isolated interpreter's runtime self-test.
+
+        Fails closed when the configured interpreter is missing (no silent
+        fallback to the host interpreter), when it cannot start, or when
+        TinyShare cannot be imported / initialised.  The probe makes no
+        remote calls and never touches the token.
+        """
+        if self.python_executable is None:
+            raise TinyShareProviderError(
+                "TINYSHARE_PYTHON is not configured; refusing to fall back to "
+                "the host interpreter"
+            )
+        interpreter = Path(self.python_executable).expanduser()
+        if not interpreter.exists():
+            raise TinyShareProviderError(
+                f"configured TINYSHARE_PYTHON does not exist: {interpreter}"
+            )
+        rows = self.call("__runtime_info__")
+        if not rows:
+            raise TinyShareProviderError("TinyShare runtime probe returned no metadata")
+        info = rows[0]
+        if info.get("api_factory_available") is not True:
+            raise TinyShareProviderError(
+                "TinyShare runtime probe failed: no pro_api/proapi factory "
+                "in the configured interpreter"
+            )
+        if info.get("api_initialization_success") is not True:
+            raise TinyShareProviderError(
+                "TinyShare runtime probe failed: API factory is not callable "
+                "in the configured interpreter"
+            )
+        return info
+
     def call(self, method: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         payload = self._invoke({"method": method, "params": params or {}})
         rows = payload.get("rows", [])

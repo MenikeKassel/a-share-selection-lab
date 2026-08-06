@@ -3,7 +3,8 @@ param(
     [string]$Source = 'D:\a_data',
     [string]$SnapshotRoot = 'data\raw\imports',
     [string]$SnapshotId = 'ashare-2018-2025-v1',
-    [switch]$RunWalkForward
+    [switch]$RunWalkForward,
+    [switch]$AllowInterpreterFallback
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,10 +29,16 @@ $defaultIsolatedPython = Join-Path $repo 'data\runtime\tinyshare-venv\Scripts\py
 $configuredIsolatedPython = $env:TINYSHARE_PYTHON
 if ($configuredIsolatedPython -and (Test-Path -LiteralPath $configuredIsolatedPython)) {
     $isolatedPython = $configuredIsolatedPython
-} else {
-    if ($configuredIsolatedPython) {
-        Write-Warning "Configured TINYSHARE_PYTHON does not exist; using the project-isolated interpreter."
+} elseif ($configuredIsolatedPython) {
+    # PR 6: a configured interpreter that does not exist is an error, not
+    # a signal to guess.  Only an explicit opt-in allows the fallback.
+    if ($AllowInterpreterFallback) {
+        Write-Warning "Configured TINYSHARE_PYTHON does not exist; using the project-isolated interpreter (explicit fallback)."
+        $isolatedPython = $defaultIsolatedPython
+    } else {
+        throw "Configured TINYSHARE_PYTHON does not exist: $configuredIsolatedPython (pass -AllowInterpreterFallback to override)"
     }
+} else {
     $isolatedPython = $defaultIsolatedPython
 }
 
