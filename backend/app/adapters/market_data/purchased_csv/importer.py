@@ -351,13 +351,16 @@ class PurchasedCsvSnapshotImporter:
             )
             frame["limit_up_price"] = [row[0] for row in limit_rows]
             frame["limit_down_price"] = [row[1] for row in limit_rows]
-            pre_close = frame["pre_close"].replace(0, np.nan)
-            tolerance = pre_close * 0.0015
+            # PR 5.3: tick-based tolerance, not a proportional band.  A-share
+            # prices tick at 0.01; half a tick (0.005) absorbs float noise
+            # from the Decimal rounding path without mislabelling an open
+            # that is 0.15 below the limit (old pre_close*0.0015 band).
+            tick_tolerance = 0.005
             frame["open_at_limit_up"] = (
-                frame["open"].fillna(np.nan) >= frame["limit_up_price"] - tolerance
+                frame["open"].fillna(np.nan) >= frame["limit_up_price"] - tick_tolerance
             )
             frame["open_at_limit_down"] = (
-                frame["open"].fillna(np.nan) <= frame["limit_down_price"] + tolerance
+                frame["open"].fillna(np.nan) <= frame["limit_down_price"] + tick_tolerance
             )
             frame["price_limit_rule_version"] = "a_share_daily_v2"
             # Deprecated aliases retained for downstream compat; the v2

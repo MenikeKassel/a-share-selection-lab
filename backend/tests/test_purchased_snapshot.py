@@ -72,7 +72,10 @@ def test_research_prices_use_causal_adjusted_view_and_execution_uses_raw_view() 
     assert research["close"].tolist() == [10.0, 10.0, 10.5]
     assert execution["close"].tolist() == [20.0, 10.0, 10.5]
     assert research["price_basis"].unique().tolist() == ["causal_hfq"]
-    assert {"adj_open", "adj_high", "adj_low", "adj_close"}.isdisjoint(execution.columns)
+    # PR 5.3: the v2 proxy engine needs the causal-adjusted open/close for
+    # total-return valuation; high/low adj stay research-only.
+    assert {"adj_open", "adj_close"}.issubset(execution.columns)
+    assert {"adj_high", "adj_low"}.isdisjoint(execution.columns)
     assert execution["adj_factor"].tolist() == [1.0, 2.0, 2.0]
 
 

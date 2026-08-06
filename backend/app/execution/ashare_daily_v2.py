@@ -538,10 +538,28 @@ class AshareDailyV2ProxyEngine:
 
     @staticmethod
     def _prepare_market(market_data: pd.DataFrame, request: BacktestRequest) -> pd.DataFrame:
-        required = {"date", "symbol", "open", "close", "volume"}
+        # PR 5.3: proxy engine fails closed when the v2 execution fields are
+        # missing.  adj_open/adj_close carry the causal total-return scale;
+        # open_at_limit_* drive open-time tradability.  Never silently fall
+        # back to raw prices (that re-introduces corporate-action distortion
+        # and the close-time limit leakage class of bugs).
+        required = {
+            "date",
+            "symbol",
+            "open",
+            "close",
+            "volume",
+            "adj_open",
+            "adj_close",
+            "open_at_limit_up",
+            "open_at_limit_down",
+        }
         missing = required.difference(market_data.columns)
         if missing:
-            raise ValueError(f"market data is missing columns: {sorted(missing)}")
+            raise ValueError(
+                "proxy market data is missing v2 execution columns: "
+                f"{sorted(missing)}"
+            )
         market = market_data.copy()
         market["date"] = pd.to_datetime(market["date"]).dt.normalize()
         market["symbol"] = market["symbol"].astype(str)

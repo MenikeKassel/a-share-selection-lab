@@ -27,6 +27,7 @@ from app.adapters.io import read_tabular
 from app.adapters.vectorbt.adapter import VectorBTResearchAdapter
 from app.api.schemas import WalkForwardRunRequest
 from app.core.config import Settings
+from app.data.contracts import POINT_IN_TIME_REQUIRED_COLUMNS
 from app.data.history import join_historical_state
 from app.data.security_master import (
     SecurityMasterStatus,
@@ -149,7 +150,7 @@ class WalkForwardTaskService:
         progress: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        self._schema_v2_capability_gate(manifest)
+        self._schema_v2_capability_gate(manifest, manifest_path)
         snapshot = validate_snapshot_manifest(
             manifest_path,
             minimum_coverage_ratio=self.settings.min_daily_coverage_ratio,
@@ -563,6 +564,12 @@ class WalkForwardTaskService:
                 "volume",
                 "amount",
                 "adj_factor",
+                "adj_open",
+                "adj_close",
+                "open_at_limit_up",
+                "open_at_limit_down",
+                "limit_up_price",
+                "limit_down_price",
                 "cash_dividend_per_share",
                 "industry",
                 "is_st",
@@ -1145,7 +1152,9 @@ class WalkForwardTaskService:
         return read_tabular(path)
 
     @staticmethod
-    def _schema_v2_capability_gate(manifest: dict[str, Any]) -> None:
+    def _schema_v2_capability_gate(
+        manifest: dict[str, Any], manifest_path: Path | None = None
+    ) -> None:
         """Schema v2 startup gate: refuse to run when the snapshot cannot
         support the integrity claims the walk-forward makes.
 
@@ -1163,6 +1172,10 @@ class WalkForwardTaskService:
           joins are effective-date as-of only.  That is a documented
           limitation, not a block; the global pit_cutoff_enforced flag
           must stay false so nobody reads it as full PIT.
+
+        PR 5.3: when ``manifest_path`` is supplied, the declared booleans
+        are cross-checked against the real files (capability claims must
+        be measured, not aspirational).
         """
         schema_version = int(manifest.get("schema_version", 1) or 1)
         if schema_version < 2:
@@ -1192,6 +1205,101 @@ class WalkForwardTaskService:
                 "history has no publication-time PIT; capabilities are "
                 "inconsistent"
             )
+        if manifest_path is not None:
+            WalkForwardTaskService._verify_capabilities_against_files(
+                manifest, manifest_path, capabilities
+            )
+
+    @staticmethod
+    def _verify_capabilities_against_files(
+        manifest: dict[str, Any],
+        manifest_path: Path,
+        capabilities: dict[str, Any],
+    ) -> None:
+        """Cross-check declared capabilities against real snapshot files.
+
+        PR 5.3: manifest booleans are claims, not evidence.  Each capability
+        is verified against the actual file/columns before the run starts.
+        """
+        snapshot_dir = manifest_path.parent
+        files = manifest.get("files") or {}
+
+        def resolve(name: str) -> Path | None:
+            entry = files.get(name)
+            if not entry:
+                return None
+            path_value = entry.get("path") if isinstance(entry, dict) else entry
+            return snapshot_dir / str(path_value) if path_value else None
+
+        def read_frame(name: str) -> pd.DataFrame | None:
+            path = resolve(name)
+            if path is None or not path.exists():
+                return None
+            return read_tabular(path)
+
+        # real_listing_dates -> security_master exists with real flags.
+        if capabilities.get("real_listing_dates") is True:
+            master = read_frame("security_master")
+            if master is None:
+                raise WalkForwardSnapshotError(
+                    "capability real_listing_dates=true but security_master file is missing"
+                )
+            if "is_real_listing_date" in master.columns:
+                real_rows = pd.Series(master["is_real_listing_date"]).fillna(False).astype(bool)
+                if not real_rows.all():
+                    raise WalkForwardSnapshotError(
+                        "security_master contains non-real listing dates; "
+                        "real_listing_dates claim is false"
+                    )
+            else:
+                raise WalkForwardSnapshotError(
+                    "security_master lacks is_real_listing_date column; "
+                    "re-run normalise_security_master"
+                )
+
+        # pit_financials_enforced -> financials exists with PIT audit columns.
+        if capabilities.get("pit_financials_enforced") is True:
+            frame = read_frame("financials")
+            if frame is None:
+                raise WalkForwardSnapshotError(
+                    "capability pit_financials_enforced=true but financials file is missing"
+                )
+            missing_pit = POINT_IN_TIME_REQUIRED_COLUMNS.difference(frame.columns)
+            if missing_pit:
+                raise WalkForwardSnapshotError(
+                    "financials is missing PIT audit columns: "
+                    f"{sorted(missing_pit)}"
+                )
+
+        # pit_valuations_enforced -> valuations exists with PIT audit columns.
+        if capabilities.get("pit_valuations_enforced") is True:
+            frame = read_frame("valuations")
+            if frame is None:
+                raise WalkForwardSnapshotError(
+                    "capability pit_valuations_enforced=true but valuations file is missing"
+                )
+            missing_pit = POINT_IN_TIME_REQUIRED_COLUMNS.difference(frame.columns)
+            if missing_pit:
+                raise WalkForwardSnapshotError(
+                    "valuations is missing PIT audit columns: "
+                    f"{sorted(missing_pit)}"
+                )
+
+        # historical_state_effective_date_asof -> state_history has the
+        # effective-date shape.
+        if capabilities.get("historical_state_effective_date_asof") is True:
+            frame = read_frame("state_history")
+            if frame is None:
+                raise WalkForwardSnapshotError(
+                    "capability historical_state_effective_date_asof=true "
+                    "but state_history file is missing"
+                )
+            state_required = {"symbol", "effective_date"}
+            if not state_required.issubset(frame.columns):
+                raise WalkForwardSnapshotError(
+                    "state_history is missing effective-date as-of columns: "
+                    f"{sorted(state_required.difference(frame.columns))}"
+                )
 
     @staticmethod
     def _blocked_report(payload: WalkForwardRunRequest, error: str) -> dict[str, Any]:
@@ -1594,6 +1702,17 @@ def _formal_run(
     performance["execution_result_level"] = result.metadata.get("execution_result_level")
     performance["corporate_action_mode"] = result.metadata.get("corporate_action_mode")
     performance["execution_confidence"] = result.metadata.get("execution_confidence")
+    # PR 5.3: proxy runs are never strict; the promotion gate keys off
+    # execution_result_level == "strict", and these fields make the
+    # provenance explicit on every window.
+    performance["strict_execution_status"] = (
+        "available"
+        if result.metadata.get("execution_result_level") == "strict"
+        else "blocked"
+    )
+    performance["production_eligible"] = (
+        result.metadata.get("execution_result_level") == "strict"
+    )
     benchmark_return = _benchmark_return(benchmark)
     tradable_return = float(performance.get("tradable_return", 0.0))
     performance["max_drawdown"] = abs(float(performance.get("max_drawdown", 0.0)))

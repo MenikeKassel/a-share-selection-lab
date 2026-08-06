@@ -31,7 +31,23 @@ def _request(**overrides) -> BacktestRequest:
 
 
 def _market(rows: list[dict]) -> pd.DataFrame:
-    return pd.DataFrame(rows)
+    frame = pd.DataFrame(rows)
+    # PR 5.3: default the v2 execution columns so existing fixtures keep
+    # working; tests that exercise fail-closed explicitly drop columns.
+    defaults = {
+        "adj_open": 0.0,
+        "adj_close": 0.0,
+        "open_at_limit_up": False,
+        "open_at_limit_down": False,
+        "limit_up_price": 0.0,
+        "limit_down_price": 0.0,
+        "suspended": False,
+        "industry": "unknown",
+    }
+    for column, value in defaults.items():
+        if column not in frame.columns:
+            frame[column] = value
+    return frame
 
 
 def _signals(rows: list[dict]) -> pd.DataFrame:
@@ -325,6 +341,41 @@ def test_ledger_industry_at_entry_preserved() -> None:
     assert sale is not None
     assert sale.industry_at_entry == "bank"
     assert sale.industry_at_exit == "tech"
+
+
+# ---------------------------------------------------------------------------
+# PR 5.3: fail-closed on missing v2 execution columns
+
+
+def test_proxy_engine_fails_closed_without_adj_open() -> None:
+    market = _market(
+        [
+            {"date": "2024-01-02", "symbol": "A", "open": 10.0, "close": 10.0,
+             "volume": 1_000_000, "suspended": False, "industry": "tech",
+             "open_at_limit_up": False, "open_at_limit_down": False,
+             "adj_close": 10.0},
+        ]
+    ).drop(columns=["adj_open"])
+    signals = _signals(
+        [{"signal_date": "2024-01-02", "symbol": "A", "score": 1.0}]
+    )
+    with pytest.raises(ValueError, match="missing v2 execution columns"):
+        AshareDailyV2ProxyEngine().run_with_data(_request(), market, signals)
+
+
+def test_proxy_engine_fails_closed_without_open_at_limit() -> None:
+    market = _market(
+        [
+            {"date": "2024-01-02", "symbol": "A", "open": 10.0, "close": 10.0,
+             "volume": 1_000_000, "suspended": False, "industry": "tech",
+             "adj_open": 10.0, "adj_close": 10.0},
+        ]
+    ).drop(columns=["open_at_limit_up", "open_at_limit_down"])
+    signals = _signals(
+        [{"signal_date": "2024-01-02", "symbol": "A", "score": 1.0}]
+    )
+    with pytest.raises(ValueError, match="missing v2 execution columns"):
+        AshareDailyV2ProxyEngine().run_with_data(_request(), market, signals)
 
 
 # ---------------------------------------------------------------------------

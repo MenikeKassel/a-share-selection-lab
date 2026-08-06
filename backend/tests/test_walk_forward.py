@@ -345,10 +345,13 @@ def test_execution_price_view_drops_research_only_wide_columns() -> None:
                 "close": 10.5,
                 "volume": 1000,
                 "adj_factor": 1.2,
+                "adj_open": 12.0,
+                "adj_close": 12.6,
+                "open_at_limit_up": False,
+                "open_at_limit_down": False,
                 "limit_up": False,
                 "limit_down": False,
                 "name": "fixture",
-                "adj_close": 12.6,
             }
         ]
     )
@@ -363,7 +366,12 @@ def test_execution_price_view_drops_research_only_wide_columns() -> None:
         prices.columns
     )
     assert "name" not in prices
-    assert "adj_close" not in prices
+    # PR 5.3: the v2 proxy engine requires the causal-adjusted and
+    # open-time fields; the execution view must carry them.
+    assert "adj_close" in prices
+    assert "adj_open" in prices
+    assert "open_at_limit_up" in prices
+    assert "open_at_limit_down" in prices
 
 
 def test_research_scan_and_formal_run_receive_different_price_views(monkeypatch) -> None:
@@ -453,6 +461,112 @@ def test_schema_v2_gate_blocks_legacy_manifest() -> None:
         WalkForwardSnapshotError, match="schema_version < 2"
     ):
         WalkForwardTaskService._schema_v2_capability_gate({"schema_version": 1})
+
+
+def test_execution_view_to_formal_run_buys_and_sells() -> None:
+    """PR 5.3 end-to-end: _prepare_execution_prices -> _formal_run must
+    produce a closed round trip (buy then sell) using adj_open/adj_close."""
+    daily = pd.DataFrame(
+        [
+            {
+                "date": "2025-01-02",
+                "symbol": "A",
+                "open": 10.0,
+                "high": 10.5,
+                "low": 9.8,
+                "close": 10.2,
+                "pre_close": 10.0,
+                "volume": 1_000_000,
+                "amount": 10_000.0,
+                "adj_factor": 1.0,
+                "adj_open": 10.0,
+                "adj_close": 10.2,
+                "open_at_limit_up": False,
+                "open_at_limit_down": False,
+                "limit_up_price": 11.0,
+                "limit_down_price": 9.0,
+                "industry": "tech",
+                "is_st": False,
+                "delisting_risk": False,
+                "suspended": False,
+            },
+            {
+                "date": "2025-01-03",
+                "symbol": "A",
+                "open": 10.3,
+                "high": 10.8,
+                "low": 10.1,
+                "close": 10.7,
+                "pre_close": 10.2,
+                "volume": 1_000_000,
+                "amount": 10_500.0,
+                "adj_factor": 1.0,
+                "adj_open": 10.3,
+                "adj_close": 10.7,
+                "open_at_limit_up": False,
+                "open_at_limit_down": False,
+                "limit_up_price": 11.22,
+                "limit_down_price": 9.18,
+                "industry": "tech",
+                "is_st": False,
+                "delisting_risk": False,
+                "suspended": False,
+            },
+            {
+                "date": "2025-01-06",
+                "symbol": "A",
+                "open": 10.9,
+                "high": 11.2,
+                "low": 10.6,
+                "close": 11.1,
+                "pre_close": 10.7,
+                "volume": 1_000_000,
+                "amount": 11_000.0,
+                "adj_factor": 1.0,
+                "adj_open": 10.9,
+                "adj_close": 11.1,
+                "open_at_limit_up": False,
+                "open_at_limit_down": False,
+                "limit_up_price": 11.77,
+                "limit_down_price": 9.63,
+                "industry": "tech",
+                "is_st": False,
+                "delisting_risk": False,
+                "suspended": False,
+            },
+        ]
+    )
+    signals = pd.DataFrame(
+        [
+            {"signal_date": "2025-01-02", "symbol": "A", "score": 1.0},
+            {"signal_date": "2025-01-03", "symbol": "A", "score": 1.0},
+        ]
+    )
+    prices = WalkForwardTaskService._prepare_execution_prices(
+        daily,
+        state_history=None,
+        suspensions=None,
+    )
+    assert {"adj_open", "adj_close", "open_at_limit_up", "open_at_limit_down"}.issubset(
+        prices.columns
+    )
+
+    payload = WalkForwardRunRequest(experiment_code="e2e-proxy-test")
+    metrics = walk_forward_service._formal_run(
+        payload,
+        prices,
+        signals,
+        params={
+            "top_n": 1,
+            "rebalance_frequency": "daily",
+            "holding_period": 1,
+            "slippage_bps": 0.0,
+        },
+    )
+    assert metrics["closed_trade_count"] >= 1
+    assert metrics["trade_count"] >= 2
+    assert metrics["execution_result_level"] == "proxy"
+    assert metrics["strict_execution_status"] == "blocked"
 
 
 def test_schema_v2_gate_blocks_missing_capabilities() -> None:

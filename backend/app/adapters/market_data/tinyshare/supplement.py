@@ -28,6 +28,7 @@ VALUATION_STORAGE_COLUMNS = [
     "period_end",
     "published_at",
     "available_at",
+    "available_at_precision",
     "fetched_at",
     "source",
     "content_hash",
