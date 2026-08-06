@@ -149,6 +149,7 @@ class WalkForwardTaskService:
         progress: ProgressCallback | None = None,
     ) -> dict[str, Any]:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        self._schema_v2_capability_gate(manifest)
         snapshot = validate_snapshot_manifest(
             manifest_path,
             minimum_coverage_ratio=self.settings.min_daily_coverage_ratio,
@@ -1142,6 +1143,55 @@ class WalkForwardTaskService:
         if not path.exists():
             raise WalkForwardSnapshotError(f"snapshot file does not exist: {path}")
         return read_tabular(path)
+
+    @staticmethod
+    def _schema_v2_capability_gate(manifest: dict[str, Any]) -> None:
+        """Schema v2 startup gate: refuse to run when the snapshot cannot
+        support the integrity claims the walk-forward makes.
+
+        PR 5.2 semantics:
+        - schema_version < 2 -> blocked (legacy snapshot, unknown PIT).
+        - real_listing_dates must be true (new-listing filter needs real
+          listing dates; a missing master silently disables the filter,
+          which would inflate the universe).
+        - pit_financials_enforced / pit_valuations_enforced must be true
+          (financial and valuation joins enforce the 18:30 boundary).
+        - explicit_corporate_actions stays false today: the proxy engine
+          handles it, so it does NOT block research/proxy runs - but the
+          promotion gate keeps production disabled (handled elsewhere).
+        - historical_state_publication_time_pit stays false today: state
+          joins are effective-date as-of only.  That is a documented
+          limitation, not a block; the global pit_cutoff_enforced flag
+          must stay false so nobody reads it as full PIT.
+        """
+        schema_version = int(manifest.get("schema_version", 1) or 1)
+        if schema_version < 2:
+            raise WalkForwardSnapshotError(
+                "snapshot schema_version < 2; re-import the snapshot with "
+                "capability metadata before running walk-forward"
+            )
+        capabilities = manifest.get("capabilities") or {}
+        missing: list[str] = []
+        for required in (
+            "real_listing_dates",
+            "pit_financials_enforced",
+            "pit_valuations_enforced",
+        ):
+            if capabilities.get(required) is not True:
+                missing.append(required)
+        if missing:
+            raise WalkForwardSnapshotError(
+                "snapshot capability gate failed: missing/disabled "
+                f"{', '.join(sorted(missing))}; re-import the snapshot"
+            )
+        if capabilities.get("pit_cutoff_enforced") is True and capabilities.get(
+            "historical_state_publication_time_pit"
+        ) is not True:
+            raise WalkForwardSnapshotError(
+                "snapshot claims global pit_cutoff_enforced but state "
+                "history has no publication-time PIT; capabilities are "
+                "inconsistent"
+            )
 
     @staticmethod
     def _blocked_report(payload: WalkForwardRunRequest, error: str) -> dict[str, Any]:

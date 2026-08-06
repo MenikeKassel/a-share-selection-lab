@@ -448,6 +448,66 @@ def test_research_scan_and_formal_run_receive_different_price_views(monkeypatch)
     assert result["evaluation_status"] == "evaluated"
 
 
+def test_schema_v2_gate_blocks_legacy_manifest() -> None:
+    with pytest.raises(
+        WalkForwardSnapshotError, match="schema_version < 2"
+    ):
+        WalkForwardTaskService._schema_v2_capability_gate({"schema_version": 1})
+
+
+def test_schema_v2_gate_blocks_missing_capabilities() -> None:
+    manifest = {"schema_version": 2, "capabilities": {}}
+    with pytest.raises(WalkForwardSnapshotError, match="capability gate failed"):
+        WalkForwardTaskService._schema_v2_capability_gate(manifest)
+
+
+def test_schema_v2_gate_blocks_disabled_real_listing_dates() -> None:
+    manifest = {
+        "schema_version": 2,
+        "capabilities": {
+            "real_listing_dates": False,
+            "pit_financials_enforced": True,
+            "pit_valuations_enforced": True,
+        },
+    }
+    with pytest.raises(WalkForwardSnapshotError, match="real_listing_dates"):
+        WalkForwardTaskService._schema_v2_capability_gate(manifest)
+
+
+def test_schema_v2_gate_blocks_inconsistent_global_pit_claim() -> None:
+    manifest = {
+        "schema_version": 2,
+        "capabilities": {
+            "real_listing_dates": True,
+            "pit_financials_enforced": True,
+            "pit_valuations_enforced": True,
+            "pit_cutoff_enforced": True,
+            "historical_state_publication_time_pit": False,
+        },
+    }
+    with pytest.raises(WalkForwardSnapshotError, match="inconsistent"):
+        WalkForwardTaskService._schema_v2_capability_gate(manifest)
+
+
+def test_schema_v2_gate_accepts_proxy_snapshot() -> None:
+    """Proxy research snapshot (no explicit corporate actions, no global
+    PIT) must still pass the gate: the proxy engine and the documented
+    effective-date state join are the supported configuration."""
+    manifest = {
+        "schema_version": 2,
+        "capabilities": {
+            "real_listing_dates": True,
+            "pit_financials_enforced": True,
+            "pit_valuations_enforced": True,
+            "explicit_corporate_actions": False,
+            "pit_cutoff_enforced": False,
+            "historical_state_publication_time_pit": False,
+        },
+    }
+    # Must not raise.
+    WalkForwardTaskService._schema_v2_capability_gate(manifest)
+
+
 def test_aggregate_windows_requires_evaluated_oos_windows() -> None:
     windows = [
         {
