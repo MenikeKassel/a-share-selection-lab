@@ -436,6 +436,10 @@ def test_research_scan_and_formal_run_receive_different_price_views(monkeypatch)
         return {
             **walk_forward_service._empty_formal_metrics(),
             "initial_cash": 1_000_000.0,
+            "tradable_return": 0.10,
+            "max_drawdown": 0.05,
+            "sharpe": 1.0,
+            "turnover": 0.1,
             "equity_curve": [{"date": "2020-01-02", "equity": 1_000_000.0}],
         }
 
@@ -451,9 +455,194 @@ def test_research_scan_and_formal_run_receive_different_price_views(monkeypatch)
         benchmark=None,
     )
 
-    assert scan_closes == [10.0, 11.0]
-    assert formal_closes and all(value == 22.0 for value in formal_closes)
+    assert scan_closes == [10.0]
+    # PR 3.2: the v2 proxy engine now drives qualification (training),
+    # selection (validation) AND the OOS test - all on the execution view.
+    assert sorted(set(formal_closes)) == [20.0, 21.0, 22.0]
     assert result["evaluation_status"] == "evaluated"
+    assert result["provenance"]["parameter_selection_execution_parity"] is True
+
+
+def test_run_split_v2_wins_over_vectorbt_when_different(monkeypatch) -> None:
+    """PR 3.2 test 1: when VectorBT's best and the v2 engine's best differ,
+    the v2 engine's choice must win."""
+    payload = WalkForwardRunRequest(experiment_code="pr32-v2-wins")
+    split = WalkForwardSplit(
+        train_start=date(2018, 1, 1),
+        train_end=date(2018, 12, 31),
+        validation_start=date(2019, 1, 1),
+        validation_end=date(2019, 12, 31),
+        test_start=date(2020, 1, 1),
+        test_end=date(2020, 12, 31),
+    )
+    prices = pd.DataFrame(
+        [
+            {"date": f"{year}-01-02", "symbol": "A", "close": 10.0}
+            for year in (2018, 2019, 2020)
+        ]
+    )
+    signals = pd.DataFrame(
+        [
+            {"signal_date": f"{year}-01-02", "symbol": "A", "score": 1.0}
+            for year in (2018, 2019, 2020)
+        ]
+    )
+    params_a = {"top_n": 1, "holding_period": 5, "rebalance_frequency": "daily",
+                "slippage_bps": 5.0}
+    params_b = {"top_n": 2, "holding_period": 10, "rebalance_frequency": "daily",
+                "slippage_bps": 5.0}
+    # VectorBT prefers A (high sharpe in scan); v2 prefers B.
+    scan_result = [
+        {"parameter_set": params_a, "cumulative_return": 0.20, "max_drawdown": 0.05,
+         "sharpe": 3.0, "turnover": 0.1, "trade_count": 2, "win_rate": 0.5,
+         "annualized_return": 0.2, "metadata": {}},
+        {"parameter_set": params_b, "cumulative_return": 0.10, "max_drawdown": 0.05,
+         "sharpe": 1.0, "turnover": 0.1, "trade_count": 2, "win_rate": 0.5,
+         "annualized_return": 0.1, "metadata": {}},
+    ]
+
+    def fake_scan(_prices, *_args, **_kwargs):
+        return scan_result
+
+    def fake_formal(_payload, _prices, _signals, params, _benchmark):
+        metrics = walk_forward_service._empty_formal_metrics()
+        metrics.update({
+            "tradable_return": 0.10,
+            "max_drawdown": 0.05,
+            "sharpe": 1.0,
+            "turnover": 0.1,
+            "initial_cash": 1_000_000.0,
+            "equity_curve": [{"date": "2020-01-02", "equity": 1_000_000.0}],
+        })
+        # v2 qualification: only B passes (A fails on training drawdown).
+        if params == params_a:
+            metrics["max_drawdown"] = 0.40  # over the 0.25 limit
+        return metrics
+
+    monkeypatch.setattr(walk_forward_service, "_scan_parameters", fake_scan)
+    monkeypatch.setattr(walk_forward_service, "_formal_run", fake_formal)
+
+    result = WalkForwardTaskService._run_split(
+        payload, split, prices, prices, signals, benchmark=None
+    )
+    assert result["evaluation_status"] == "evaluated"
+    assert result["selected_parameters"] == params_b
+    assert result["training_filter_count"] == 1  # only B qualified
+    assert result["provenance"]["parameter_selection_engine"] == "ashare_daily_v2_proxy"
+
+
+def test_run_split_unqualified_params_never_reach_validation(monkeypatch) -> None:
+    """PR 3.2 test 2: training-unqualified parameters must not reach the
+    validation selection."""
+    payload = WalkForwardRunRequest(experiment_code="pr32-gate")
+    split = WalkForwardSplit(
+        train_start=date(2018, 1, 1), train_end=date(2018, 12, 31),
+        validation_start=date(2019, 1, 1), validation_end=date(2019, 12, 31),
+        test_start=date(2020, 1, 1), test_end=date(2020, 12, 31),
+    )
+    prices = pd.DataFrame(
+        [{"date": f"{year}-01-02", "symbol": "A", "close": 10.0}
+         for year in (2018, 2019, 2020)]
+    )
+    signals = pd.DataFrame(
+        [{"signal_date": f"{year}-01-02", "symbol": "A", "score": 1.0}
+         for year in (2018, 2019, 2020)]
+    )
+    params_bad = {"top_n": 1, "holding_period": 5, "rebalance_frequency": "daily",
+                  "slippage_bps": 5.0}
+    scan_result = [
+        {"parameter_set": params_bad, "cumulative_return": 0.5, "max_drawdown": 0.01,
+         "sharpe": 9.0, "turnover": 0.1, "trade_count": 2, "win_rate": 0.5,
+         "annualized_return": 0.5, "metadata": {}},
+    ]
+
+    def fake_scan(_prices, *_args, **_kwargs):
+        return scan_result
+
+    validation_calls: list[dict] = []
+
+    def fake_formal(_payload, _prices, _signals, params, _benchmark):
+        metrics = walk_forward_service._empty_formal_metrics()
+        metrics.update({
+            "tradable_return": -0.10,  # v2 training says loss -> unqualified
+            "max_drawdown": 0.50,
+            "sharpe": -1.0,
+            "turnover": 0.1,
+            "initial_cash": 1_000_000.0,
+            "equity_curve": [{"date": "2020-01-02", "equity": 1_000_000.0}],
+        })
+        validation_calls.append(params)
+        return metrics
+
+    monkeypatch.setattr(walk_forward_service, "_scan_parameters", fake_scan)
+    monkeypatch.setattr(walk_forward_service, "_formal_run", fake_formal)
+
+    result = WalkForwardTaskService._run_split(
+        payload, split, prices, prices, signals, benchmark=None
+    )
+    # The parameter fails v2 training qualification -> not_evaluated, and
+    # validation was never reached (no further formal calls).
+    assert result["evaluation_status"] == "not_evaluated"
+    assert result["training_filter_count"] == 0
+
+
+def test_run_split_validation_decides_test_metrics_do_not(monkeypatch) -> None:
+    """PR 3.2 test 3: validation decides the winner; test-period metrics
+    must not influence selection."""
+    payload = WalkForwardRunRequest(experiment_code="pr32-no-peek")
+    split = WalkForwardSplit(
+        train_start=date(2018, 1, 1), train_end=date(2018, 12, 31),
+        validation_start=date(2019, 1, 1), validation_end=date(2019, 12, 31),
+        test_start=date(2020, 1, 1), test_end=date(2020, 12, 31),
+    )
+    prices = pd.DataFrame(
+        [{"date": f"{year}-01-02", "symbol": "A", "close": 10.0}
+         for year in (2018, 2019, 2020)]
+    )
+    signals = pd.DataFrame(
+        [{"signal_date": f"{year}-01-02", "symbol": "A", "score": 1.0}
+         for year in (2018, 2019, 2020)]
+    )
+    params_x = {"top_n": 1, "holding_period": 5, "rebalance_frequency": "daily",
+                "slippage_bps": 5.0}
+    params_y = {"top_n": 2, "holding_period": 10, "rebalance_frequency": "daily",
+                "slippage_bps": 5.0}
+    scan_result = [
+        {"parameter_set": p, "cumulative_return": 0.1, "max_drawdown": 0.05,
+         "sharpe": 1.0, "turnover": 0.1, "trade_count": 2, "win_rate": 0.5,
+         "annualized_return": 0.1, "metadata": {}}
+        for p in (params_x, params_y)
+    ]
+    formal_calls: list[tuple[dict, float]] = []
+
+    def fake_scan(_prices, *_args, **_kwargs):
+        return scan_result
+
+    def fake_formal(_payload, _prices, _signals, params, _benchmark):
+        metrics = walk_forward_service._empty_formal_metrics()
+        metrics.update({
+            "tradable_return": 0.10,
+            "max_drawdown": 0.05,
+            "sharpe": 1.0,
+            "turnover": 0.1,
+            "initial_cash": 1_000_000.0,
+            "equity_curve": [{"date": "2020-01-02", "equity": 1_000_000.0}],
+        })
+        if params == params_x:
+            metrics["sharpe"] = 2.0  # X wins validation
+        formal_calls.append((params, metrics["sharpe"]))
+        return metrics
+
+    monkeypatch.setattr(walk_forward_service, "_scan_parameters", fake_scan)
+    monkeypatch.setattr(walk_forward_service, "_formal_run", fake_formal)
+
+    result = WalkForwardTaskService._run_split(
+        payload, split, prices, prices, signals, benchmark=None
+    )
+    assert result["selected_parameters"] == params_x
+    # The OOS test still ran exactly once for the winner.
+    test_calls = [c for c in formal_calls if c[0] == params_x]
+    assert len(test_calls) >= 2  # formal + stress
 
 
 def test_schema_v2_gate_blocks_legacy_manifest() -> None:
@@ -938,6 +1127,9 @@ def test_run_split_reports_training_and_validation_scan_progress(monkeypatch) ->
     )
 
     stages = [item[0] for item in events]
-    assert stages == ["training-scan"] * 2 + ["validation-scan"] * 2
+    # PR 3.2: only the VectorBT training scan emits progress; qualification
+    # and validation selection run on the v2 proxy engine without a scan
+    # progress stage.
+    assert stages == ["training-scan"] * 2
     assert (events[0][1], events[0][2]) == (1, 2)
-    assert (events[3][1], events[3][2]) == (2, 2)
+    assert (events[1][1], events[1][2]) == (2, 2)

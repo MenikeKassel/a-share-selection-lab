@@ -683,8 +683,11 @@ class WalkForwardTaskService:
         train_research_prices = _date_filter(
             research_prices, "date", split.train_start, split.train_end
         )
-        validation_research_prices = _date_filter(
-            research_prices, "date", split.validation_start, split.validation_end
+        train_execution_prices = _date_filter(
+            execution_prices, "date", split.train_start, split.train_end
+        )
+        validation_execution_prices = _date_filter(
+            execution_prices, "date", split.validation_start, split.validation_end
         )
         test_execution_prices = _date_filter(
             execution_prices, "date", split.test_start, split.test_end
@@ -695,6 +698,8 @@ class WalkForwardTaskService:
             else None
         )
         grid = payload.parameter_grid
+        # PR 3.2: VectorBT scan is kept ONLY as a speed diagnostic and
+        # cross-reference; it no longer decides qualification or selection.
         scan = _scan_parameters(
             train_research_prices,
             train_signals,
@@ -712,11 +717,28 @@ class WalkForwardTaskService:
         training_scan_file = (
             f"training-scan-{split.train_start:%Y}-{split.train_end:%Y}.parquet"
         )
+        # PR 3.2: qualification moves to the v2 proxy engine.  Every
+        # parameter is replayed on the training window with the formal
+        # engine (T+1, board lots, minimum commission, stamp tax, open-time
+        # limits, industry caps, proxy corporate-action accounting).
+        qualification = [
+            {
+                "parameter_set": item["parameter_set"],
+                "train": _formal_run(
+                    payload,
+                    train_execution_prices,
+                    train_signals,
+                    item["parameter_set"],
+                    None,
+                ),
+            }
+            for item in scan
+        ]
         eligible = [
             item
-            for item in scan
-            if float(item.get("cumulative_return", 0.0)) > 0
-            and float(item.get("max_drawdown", 1.0)) <= payload.max_drawdown_limit
+            for item in qualification
+            if float(item["train"].get("tradable_return", 0.0)) > 0
+            and float(item["train"].get("max_drawdown", 1.0)) <= payload.max_drawdown_limit
         ]
         if not eligible:
             empty = _empty_formal_metrics()
@@ -741,38 +763,33 @@ class WalkForwardTaskService:
                 "nearby_parameters": [],
                 "failure_reason": "no training parameter passed cost and drawdown filters",
             }
-        candidates = eligible
-        validation_scan = _scan_parameters(
-            validation_research_prices,
-            validation_signals,
-            grid,
-            payload.initial_cash,
-            progress=(
-                lambda done, total, detail: progress(
-                    "validation-scan", done, total, detail
-                )
-                if progress is not None
-                else None
-            ),
-        )
-        by_key = {_parameter_key(item["parameter_set"]): item for item in validation_scan}
+        # PR 3.2: validation selection also runs on the v2 proxy engine.
+        # The validation window decides the winner; test-period metrics
+        # never influence the choice.
+        validation_results = [
+            {
+                "parameter_set": item["parameter_set"],
+                "validation": _formal_run(
+                    payload,
+                    validation_execution_prices,
+                    validation_signals,
+                    item["parameter_set"],
+                    None,
+                ),
+            }
+            for item in eligible
+        ]
         selected = max(
-            candidates,
+            validation_results,
             key=lambda item: (
-                float(
-                    by_key.get(_parameter_key(item["parameter_set"]), {}).get("sharpe", -math.inf)
-                ),
-                -float(
-                    by_key.get(_parameter_key(item["parameter_set"]), {}).get(
-                        "max_drawdown", math.inf
-                    )
-                ),
-                -float(
-                    by_key.get(_parameter_key(item["parameter_set"]), {}).get("turnover", math.inf)
-                ),
+                float(item["validation"].get("sharpe", -math.inf)),
+                -float(item["validation"].get("max_drawdown", math.inf)),
+                -float(item["validation"].get("turnover", math.inf)),
+                float(item["validation"].get("tradable_return", 0.0)),
             ),
         )
         selected_params = selected["parameter_set"]
+        selected_validation = selected["validation"]
         formal = _formal_run(
             payload,
             test_execution_prices,
@@ -787,6 +804,8 @@ class WalkForwardTaskService:
             {**selected_params, "slippage_bps": 10.0},
             test_benchmark,
         )
+        # PR 3.2: nearby-parameter stability is measured with the same
+        # formal engine as the winner (no VectorBT/formal mixing).
         nearby = []
         for item in scan:
             if item["parameter_set"] == selected_params:
@@ -804,6 +823,16 @@ class WalkForwardTaskService:
                         ),
                     }
                 )
+        provenance = {
+            "parameter_scan_engine": "vectorbt",
+            "parameter_qualification_engine": "ashare_daily_v2_proxy",
+            "parameter_selection_engine": "ashare_daily_v2_proxy",
+            "oos_execution_engine": "ashare_daily_v2_proxy",
+            "parameter_selection_execution_parity": True,
+            "corporate_action_mode": "total_return_proxy",
+            "execution_confidence": "reduced",
+            "promotion_eligible": False,
+        }
         return {
             "train_start": split.train_start.isoformat(),
             "train_end": split.train_end.isoformat(),
@@ -816,12 +845,13 @@ class WalkForwardTaskService:
             "training_scan_file": training_scan_file,
             "_training_scan": scan,
             "selected_parameters": selected_params,
-            "selected_validation": by_key.get(_parameter_key(selected_params), {}),
+            "selected_validation": selected_validation,
             "training_filter_count": len(eligible),
             "evaluation_status": "evaluated",
             "test_metrics": formal,
             "stress_10bps": stress,
             "nearby_parameters": nearby,
+            "provenance": provenance,
         }
 
     @staticmethod
